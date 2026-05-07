@@ -107,3 +107,6 @@ export const ampAdapter: AgentAdapter = {
     return []
   },
 }
+
+import { ampTransforms } from "../transforms/amp"
+export { ampTransforms }
