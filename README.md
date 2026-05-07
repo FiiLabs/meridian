@@ -492,27 +492,51 @@ ForgeCode uses reqwest's default User-Agent, so automatic detection isn't possib
 
 [Amp](https://ampcode.com) is Sourcegraph's coding agent (npm: `@sourcegraph/amp`). Meridian's Amp adapter uses **selective passthrough**: Claude inference (Amp's `smart` mode) routes through your Claude Max subscription, while every other Amp endpoint (threads sync, attachments, telemetry, login, usage, web UI, code review) is forwarded transparently to `https://ampcode.com` so the entire Amp app keeps working.
 
-Install Amp once and log in against the real `ampcode.com` to acquire your `AMP_API_KEY`:
+**Step 1 — install Amp and log in against `ampcode.com` once** to acquire your API key:
 
 ```bash
 npm install -g @sourcegraph/amp
 amp login
 ```
 
-Then point Amp at Meridian for subsequent invocations. **Amp keys credentials by server URL**, so you also need to pass your stored key as `AMP_API_KEY` (the key Amp saved is for `https://ampcode.com`, not the local URL):
+**Step 2 — wire Amp to Meridian.** Amp keys credentials by server URL, so we tell it the new URL via its settings file *and* register the same key under that URL in its secrets store. After this, plain `amp` works — no env vars needed.
 
 ```bash
-export AMP_URL=http://127.0.0.1:3456
-export AMP_API_KEY=$(python3 -c "import json; print(json.load(open(f'{__import__(\"os\").path.expanduser(\"~\")}/.local/share/amp/secrets.json'))['apiKey@https://ampcode.com/'])")
-amp -x "say hi"
+# Point Amp's CLI at Meridian
+mkdir -p ~/.config/amp
+cat > ~/.config/amp/settings.json <<'EOF'
+{
+  "amp.url": "http://127.0.0.1:3456"
+}
+EOF
+
+# Register your existing key under the local URL.
+# (Amp stores secrets keyed by URL verbatim — note: no trailing slash here, must
+#  match the value in settings.json exactly.)
+python3 - <<'PY'
+import json, os
+p = os.path.expanduser("~/.local/share/amp/secrets.json")
+d = json.load(open(p))
+d["apiKey@http://127.0.0.1:3456"] = d["apiKey@https://ampcode.com/"]
+json.dump(d, open(p, "w"), indent=2)
+PY
+chmod 600 ~/.local/share/amp/secrets.json
 ```
 
-Or simpler — read it once and stash in your shell rc:
+That's it. Now just run `amp` like normal:
 
 ```bash
-# ~/.zshrc or ~/.bashrc
+amp                  # interactive
+amp -x "say hi"      # headless
+amp threads list
+```
+
+If you'd rather use env vars instead of editing config files (e.g., for one-off runs against a different Meridian port), this also works:
+
+```bash
 export AMP_URL=http://127.0.0.1:3456
-export AMP_API_KEY="sgamp_user_..."   # paste from ~/.local/share/amp/secrets.json
+export AMP_API_KEY=$(python3 -c "import json,os; print(json.load(open(f'{os.path.expanduser(\"~\")}/.local/share/amp/secrets.json'))['apiKey@https://ampcode.com/'])")
+amp -x "say hi"
 ```
 
 #### Billing — what's free, what isn't
@@ -543,7 +567,7 @@ Meridian never originates a charge. It only intercepts Anthropic/Claude requests
 #### Known limitations
 
 - **One-time `amp login` against real `ampcode.com`** is required to acquire `AMP_API_KEY`. The login flow itself can't be completed through Meridian (the OAuth callback needs Sourcegraph's real login page).
-- **Amp keys credentials by server URL.** Your stored key is registered for `https://ampcode.com`, not `http://127.0.0.1:3456`, so you must export `AMP_API_KEY` explicitly when pointing Amp at Meridian (see Setup above).
+- **Amp keys credentials by server URL.** Your stored key is registered for `https://ampcode.com`, not `http://127.0.0.1:3456`. The setup above writes a second entry under the local URL (no trailing slash — must match `amp.url` exactly) so plain `amp` works without env vars.
 - **Non-Claude modes still bill against your Sourcegraph account.** `amp --mode deep/large/rush` use providers Meridian can't intercept; the forwarder passes those requests through to `ampcode.com` and Sourcegraph charges normally. See "Billing" above for the full breakdown.
 - **Live thread sync via WebSockets** (multi-device updates without polling) goes through the catch-all forwarder; HTTP routes are verified, but the WS upgrade path hasn't been live-tested. Polling-based `amp threads list` works fine.
 - **Multimodal (image attachments) not yet live-verified.** Should work since Amp uses Claude's standard image format, but no end-to-end confirmation in this release.
