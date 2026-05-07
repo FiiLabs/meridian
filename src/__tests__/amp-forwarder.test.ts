@@ -169,3 +169,45 @@ describe("ampForwardRequest — REST", () => {
     process.env.AMP_UPSTREAM_URL = `http://127.0.0.1:${upstreamServer!.port}`
   })
 })
+
+describe("ampForwardRequest — streaming (SSE)", () => {
+  it("streams response body without buffering", async () => {
+    upstreamServer?.stop()
+    const chunks = ["data: a\n\n", "data: b\n\n", "data: c\n\n"]
+    upstreamServer = Bun.serve({
+      port: 0,
+      async fetch(_req) {
+        const stream = new ReadableStream({
+          async start(controller) {
+            const enc = new TextEncoder()
+            for (const chunk of chunks) {
+              controller.enqueue(enc.encode(chunk))
+              await new Promise(r => setTimeout(r, 5))
+            }
+            controller.close()
+          },
+        })
+        return new Response(stream, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        })
+      },
+    })
+    process.env.AMP_UPSTREAM_URL = `http://127.0.0.1:${upstreamServer.port}`
+
+    const ctx = makeCtx({ method: "GET", path: "/api/thread-actors-stream" })
+    const res = await ampForwardRequest(ctx)
+    expect(res.status).toBe(200)
+    expect(res.headers.get("content-type")).toBe("text/event-stream")
+
+    const reader = res.body!.getReader()
+    const dec = new TextDecoder()
+    let received = ""
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      received += dec.decode(value)
+    }
+    expect(received).toBe(chunks.join(""))
+  })
+})
