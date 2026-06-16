@@ -56,7 +56,7 @@
           };
 
         flake = {
-          homeManagerModules = {
+          homeModules = {
             default = self.homeManagerModules.meridian;
             meridian = moduleWithSystem (
               { self', ... }: import ./nix/hm-module.nix { inherit (self'.packages) meridian; }
