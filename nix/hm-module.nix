@@ -85,7 +85,7 @@ in
       Unit.Description = "Meridian - Local Anthropic API proxy";
 
       Service = {
-        Type = "simple";
+        Type = "exec";
         ExecStart = lib.getExe pkg;
         Restart = "on-failure";
         RestartSec = 5;
