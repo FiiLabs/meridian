@@ -78,6 +78,7 @@ export interface OpenAiChatRequest {
   reasoning_effort?: string
   /** Anthropic-style nesting some clients use. */
   output_config?: { effort?: string }
+  stream_options?: { include_usage?: boolean }
 }
 
 export interface AnthropicTextBlock {
@@ -197,6 +198,7 @@ export interface OpenAiStreamChunk {
     }
     finish_reason: "stop" | "length" | "tool_calls" | null
   }>
+  usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number }
 }
 
 export interface OpenAiCompletionFunctionToolCall {
@@ -601,10 +603,12 @@ export interface AnthropicSseEvent {
     | { type: "thinking"; thinking?: string }
     | AnthropicToolUseBlock
   message?: { id?: string }
+  usage?: AnthropicUsage
 }
 
 export interface SseTranslator {
   (event: AnthropicSseEvent): OpenAiStreamChunk | null
+  buildUsageChunk(): OpenAiStreamChunk | null
 }
 
 export interface SseTranslatorContext {
@@ -613,6 +617,7 @@ export interface SseTranslatorContext {
   created: number
   /** When false, thinking blocks are stripped from the response */
   thinkingPassthrough?: boolean
+  includeUsage?: boolean
 }
 
 /**
@@ -629,7 +634,9 @@ export interface SseTranslatorContext {
  */
 export function createSseTranslator(ctx: SseTranslatorContext): SseTranslator {
   let toolCallIndex = -1 // -1 means "no tools used yet", becomes 0 on first block
-  return (event) => {
+  let lastUsage: AnthropicUsage | undefined
+
+  const translate = ((event: AnthropicSseEvent) => {
     // Increment must use the same condition the pure translator uses to
     // decide a tool-start chunk gets emitted, otherwise indexes drift if a
     // malformed event is skipped.
@@ -641,6 +648,10 @@ export function createSseTranslator(ctx: SseTranslatorContext): SseTranslator {
       toolCallIndex++
     }
 
+    if (event.type === "message_delta" && event.usage) {
+      lastUsage = event.usage
+    }
+
     return translateAnthropicSseEvent(
       event,
       ctx.completionId,
@@ -649,7 +660,27 @@ export function createSseTranslator(ctx: SseTranslatorContext): SseTranslator {
       toolCallIndex,
       ctx.thinkingPassthrough,
     )
+  }) as SseTranslator
+
+  translate.buildUsageChunk = () => {
+    if (!ctx.includeUsage || !lastUsage) return null
+    const promptTokens = lastUsage.input_tokens ?? 0
+    const completionTokens = lastUsage.output_tokens ?? 0
+    return {
+      id: ctx.completionId,
+      object: "chat.completion.chunk",
+      created: ctx.created,
+      model: ctx.model,
+      choices: [],
+      usage: {
+        prompt_tokens: promptTokens,
+        completion_tokens: completionTokens,
+        total_tokens: promptTokens + completionTokens,
+      },
+    }
   }
+
+  return translate
 }
 
 /**

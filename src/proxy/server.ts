@@ -497,7 +497,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           ? { ANTHROPIC_DEFAULT_OPUS_MODEL: requestedModel }
           : requestedModel.startsWith("claude-fable-")
             ? { ANTHROPIC_DEFAULT_FABLE_MODEL: requestedModel }
-            : undefined
+            : requestedModel.startsWith("claude-sonnet-")
+              ? { ANTHROPIC_DEFAULT_SONNET_MODEL: requestedModel }
+              : requestedModel.startsWith("claude-haiku-")
+                ? { ANTHROPIC_DEFAULT_HAIKU_MODEL: requestedModel }
+                : undefined
         // workingDirectory = SDK subprocess cwd (must exist on the proxy host).
         // clientWorkingDirectory = the client's local path (may not exist here);
         // used for per-project fingerprint bucketing and a system-prompt hint
@@ -1000,6 +1004,16 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 // rejects undefined ("expected object, received undefined"), which also
                 // cascades into "Reached maximum number of turns (2)". {} is the no-op.
                 if (input.tool_name === "ToolSearch") return {}
+                // StructuredOutput is the SDK-internal tool that implements
+                // native output_config.format — the CLI injects it whenever
+                // outputFormat is set, and schema validation + retry live
+                // inside the nested session. Denying it as a client
+                // passthrough tool blocks the model from ever submitting its
+                // result: the session burns to max_turns and the result
+                // message arrives without structured_output (HTTP 500). Let
+                // the SDK handle it internally, and never capture it as a
+                // client tool_use.
+                if (input.tool_name === "StructuredOutput") return {}
                 // Track deferred tools that were discovered via ToolSearch
                 const toolName = stripMcpPrefix(input.tool_name)
                 if (hasDeferredTools && coreSet && !coreSet.has(toolName.toLowerCase())) {
@@ -1052,6 +1066,17 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     name: toolName,
                     reason: exceedsForcedSingle ? "forced_single" : "same_tool_repeat",
                   })
+                  // Every distinct tool_use for this exchange is captured and the
+                  // model is now looping against blocked tools — kill the nested
+                  // SDK session immediately instead of letting it generate denied
+                  // retries until the turn budget runs out (#570). Hook-level
+                  // `interrupt: true` / `continue: false` cannot do this: neither
+                  // key exists in the CLI's hook-output schema, so both are
+                  // stripped before the deny is processed (verified against the
+                  // real SDK). Aborting the query's controller SIGTERMs the
+                  // subprocess; the abort-shaped termination is converted into a
+                  // clean stop_reason:"tool_use" response by the recovery paths.
+                  requestAbort.abort("passthrough single-step complete")
                 } else {
                   capturedSignatures.add(signature)
                   capturedToolNames.add(toolName)
@@ -2450,8 +2475,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
               // tools and drives the next turn (the same outcome as a normal
               // tool-use cycle). Without this, the client sees a 500 even
               // though we already streamed everything it needs.
+              // "aborted" is accepted only for the proxy's own single-step
+              // abort (sawDuplicateToolUse) — a client-disconnect abort must
+              // not be recorded as a recovered success.
               const canRecoverAsToolUse =
-                sdkTerm.reason === "max_turns" &&
+                (sdkTerm.reason === "max_turns" ||
+                  (sdkTerm.reason === "aborted" && sawDuplicateToolUse)) &&
                 passthrough &&
                 capturedToolUses.length > 0 &&
                 messageStartEmitted
@@ -3005,7 +3034,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         let buffer = ""
         let streamError: Error | null = null
 
-        const translate = createSseTranslator({ completionId, model, created, thinkingPassthrough: sdkFeatures.thinkingPassthrough })
+        const streamOptions = rawBody.stream_options as { include_usage?: boolean } | undefined
+        const includeUsage = streamOptions?.include_usage === true
+
+        const translate = createSseTranslator({ completionId, model, created, thinkingPassthrough: sdkFeatures.thinkingPassthrough, includeUsage })
 
         try {
           while (true) {
@@ -3033,7 +3065,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         } catch (err) {
           streamError = err instanceof Error ? err : new Error(String(err))
         } finally {
-          if (!streamError) controller.enqueue(encoder.encode("data: [DONE]\n\n"))
+          if (!streamError) {
+            const usageChunk = translate.buildUsageChunk()
+            if (usageChunk) {
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(usageChunk)}\n\n`))
+            }
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"))
+          }
           controller.close()
         }
       },
