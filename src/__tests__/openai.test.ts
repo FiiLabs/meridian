@@ -1149,6 +1149,34 @@ describe("createSseTranslator", () => {
     expect(chunks[4]!.choices[0]!.delta.tool_calls![0]!.index).toBe(0)
     expect(chunks[5]!.choices[0]!.finish_reason).toBe("tool_calls")
   })
+
+  it("buildUsageChunk returns null when includeUsage was not requested", () => {
+    const translate = createSseTranslator(CTX)
+    translate({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { input_tokens: 10, output_tokens: 5 } })
+    expect(translate.buildUsageChunk()).toBeNull()
+  })
+
+  it("buildUsageChunk returns null when no message_delta.usage was observed", () => {
+    const translate = createSseTranslator({ ...CTX, includeUsage: true })
+    translate({ type: "message_delta", delta: { stop_reason: "end_turn" } })
+    expect(translate.buildUsageChunk()).toBeNull()
+  })
+
+  it("buildUsageChunk returns a populated trailing chunk with empty choices when requested", () => {
+    const translate = createSseTranslator({ ...CTX, includeUsage: true })
+    translate({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { input_tokens: 132, output_tokens: 37 } })
+    const chunk = translate.buildUsageChunk()
+    expect(chunk).not.toBeNull()
+    expect(chunk!.choices).toEqual([])
+    expect(chunk!.usage).toEqual({ prompt_tokens: 132, completion_tokens: 37, total_tokens: 169 })
+  })
+
+  it("buildUsageChunk uses the latest message_delta.usage if multiple arrive", () => {
+    const translate = createSseTranslator({ ...CTX, includeUsage: true })
+    translate({ type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { input_tokens: 100, output_tokens: 10 } })
+    translate({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { input_tokens: 100, output_tokens: 42 } })
+    expect(translate.buildUsageChunk()!.usage).toEqual({ prompt_tokens: 100, completion_tokens: 42, total_tokens: 142 })
+  })
 })
 
 // ---------------------------------------------------------------------------

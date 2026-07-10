@@ -3034,7 +3034,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         let buffer = ""
         let streamError: Error | null = null
 
-        const translate = createSseTranslator({ completionId, model, created, thinkingPassthrough: sdkFeatures.thinkingPassthrough })
+        const streamOptions = rawBody.stream_options as { include_usage?: boolean } | undefined
+        const includeUsage = streamOptions?.include_usage === true
+
+        const translate = createSseTranslator({ completionId, model, created, thinkingPassthrough: sdkFeatures.thinkingPassthrough, includeUsage })
 
         try {
           while (true) {
@@ -3062,7 +3065,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         } catch (err) {
           streamError = err instanceof Error ? err : new Error(String(err))
         } finally {
-          if (!streamError) controller.enqueue(encoder.encode("data: [DONE]\n\n"))
+          if (!streamError) {
+            const usageChunk = translate.buildUsageChunk()
+            if (usageChunk) {
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(usageChunk)}\n\n`))
+            }
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"))
+          }
           controller.close()
         }
       },
