@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.45.1](https://github.com/rynfar/meridian/compare/meridian-v1.45.0...meridian-v1.45.1) (2026-07-10)
+
+
+### Bug Fixes
+
+* forward explicit sonnet/haiku model requests via ANTHROPIC_DEFAULT_*_MODEL overrides ([0b6215a](https://github.com/rynfar/meridian/commit/0b6215a2500e20bebbd6616c418082d1f14543d1))
+* forward sonnet/haiku model requests via ANTHROPIC_DEFAULT_*_MODEL overrides ([49d2798](https://github.com/rynfar/meridian/commit/49d2798a0ca803db1c9772cfd1bed31cf61acb26))
+* **passthrough:** abort nested SDK session once single-step capture completes ([#575](https://github.com/rynfar/meridian/issues/575)) ([b6e9cfe](https://github.com/rynfar/meridian/commit/b6e9cfe0e70af7292f9fa78855ed24ee4573cedb)), closes [#570](https://github.com/rynfar/meridian/issues/570)
+* **passthrough:** correct single-step semantics for client-driven tool loops ([#571](https://github.com/rynfar/meridian/issues/571)) ([35b6b92](https://github.com/rynfar/meridian/commit/35b6b927b348b7ac952b9cf19590565ecf866bb3))
+* **passthrough:** exempt SDK-internal StructuredOutput tool from deny hook ([#577](https://github.com/rynfar/meridian/issues/577)) ([8edba2e](https://github.com/rynfar/meridian/commit/8edba2e72f30110e548487a18dc8f1b1b096d3c5)), closes [#576](https://github.com/rynfar/meridian/issues/576)
+* propagate client request cancellation ([#574](https://github.com/rynfar/meridian/issues/574)) ([06c4dca](https://github.com/rynfar/meridian/commit/06c4dcac02a462822d1d9a4f8908d004601825e1))
+* remove MultiEdit from BLOCKED_BUILTIN_TOOLS ([8d14403](https://github.com/rynfar/meridian/commit/8d144034ae9c05362113a4ddd715f610ce9a36dc))
+* remove MultiEdit from BLOCKED_BUILTIN_TOOLS ([f3ea852](https://github.com/rynfar/meridian/commit/f3ea852e9d7429f3ec7fb112f3d7c42169296dfa))
+* support native structured output ([#573](https://github.com/rynfar/meridian/issues/573)) ([8773ac2](https://github.com/rynfar/meridian/commit/8773ac2b413e8cfdef2f10fbcd8314c0a2437420))
+
 ## [1.45.0](https://github.com/rynfar/meridian/compare/meridian-v1.44.1...meridian-v1.45.0) (2026-07-01)
 
 
