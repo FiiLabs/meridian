@@ -6,7 +6,7 @@
  */
 
 import { join } from "node:path"
-import type { Options, SdkBeta, SettingSource } from "@anthropic-ai/claude-agent-sdk"
+import type { Options, OutputFormat, SdkBeta, SettingSource } from "@anthropic-ai/claude-agent-sdk"
 import { createOpencodeMcpServer } from "../mcpTools"
 import { createPassthroughMcpServer, PASSTHROUGH_MCP_NAME } from "./passthroughTools"
 import { envInt } from "../env"
@@ -88,6 +88,8 @@ export interface QueryContext {
   thinking?: { type: 'adaptive' } | { type: 'enabled'; budgetTokens?: number } | { type: 'disabled' }
   /** API-side task budget in tokens — model paces tool use within this limit */
   taskBudget?: { total: number }
+  /** Native JSON-schema output contract for the Claude Agent SDK */
+  outputFormat?: OutputFormat
   /** Beta features to enable */
   betas?: string[]
   /** SDK setting sources — controls CLAUDE.md and user settings loading */
@@ -226,7 +228,7 @@ export function buildQueryOptions(ctx: QueryContext): BuildQueryResult {
     passthrough, stream, sdkAgents, passthroughMcp, cleanEnv, hasDeferredTools,
     resumeSessionId, isUndo, undoRollbackUuid, sdkHooks, blockedTools, incompatibleTools,
     mcpServerName, allowedMcpTools, onStderr,
-    effort, thinking, taskBudget, betas, settingSources, codeSystemPrompt, clientSystemPrompt,
+    effort, thinking, taskBudget, outputFormat, betas, settingSources, codeSystemPrompt, clientSystemPrompt,
     memory, dreaming, sharedMemory, maxBudgetUsd, fallbackModel, sdkDebug, additionalDirectories,
   } = ctx
   const cwdNote = buildCwdNote(workingDirectory, clientWorkingDirectory)
@@ -321,6 +323,7 @@ export function buildQueryOptions(ctx: QueryContext): BuildQueryResult {
       ...(effort ? { effort } : {}),
       ...(thinking ? { thinking } : {}),
       ...(taskBudget ? { taskBudget } : {}),
+      ...(outputFormat ? { outputFormat } : {}),
       ...(betas && betas.length > 0 ? { betas: betas as SdkBeta[] } : {}),
       ...(maxBudgetUsd && maxBudgetUsd > 0 ? { maxBudgetUsd } : {}),
       ...(fallbackModel ? { fallbackModel } : {}),
