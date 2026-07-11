@@ -234,43 +234,47 @@ function buildFreshPrompt(
   messages: Array<{ role: string; content: any }>,
   sanitizeOpts: import("./sanitize").SanitizeOptions = {}
 ): string | AsyncIterable<any> {
-  const hasMultimodal = messages.some((m) => hasMultimodalContent(m.content))
-
-  if (hasMultimodal) {
-    const structured: Array<{ type: "user"; message: { role: string; content: any }; parent_tool_use_id: null }> = []
-    for (const m of messages) {
-      if (m.role === "user") {
+  // Always replay history as a stream of DISCRETE structured messages rather
+  // than flattening it into one `Human: …\n\nAssistant: …` transcript string.
+  // The flattened form ends in an `Assistant:`/`Human:` transcript that the
+  // single-turn completion model continues on its own — fabricating fake
+  // `Human:` turns and replying on the user's behalf (leaks raw prompt labels
+  // and auto-advances the conversation, issues #111/#386 recur on the text
+  // path). Emitting discrete messages removes that transcript, so the model
+  // sees turn boundaries instead of dangling text to continue.
+  //
+  // The SDK's streaming input only accepts user messages, so assistant history
+  // is quoted as `[Assistant: …]` user turns (identical to the multimodal path
+  // that already ships). Text-only user turns still run through
+  // flattenUserContent so orchestration-tag sanitize (sanitizeOpts) is kept.
+  const structured: Array<{ type: "user"; message: { role: string; content: any }; parent_tool_use_id: null }> = []
+  for (const m of messages) {
+    if (m.role === "user") {
+      const content = hasMultimodalContent(m.content)
+        ? normalizeStructuredUserContent(stripCacheControlDeep(m.content))
+        : flattenUserContent(m.content, sanitizeOpts)
+      // Skip empty user turns (all blocks stripped -> "" or []).
+      if (typeof content === "string" ? content.length > 0 : content.length > 0) {
         structured.push({
           type: "user" as const,
-          message: { role: "user" as const, content: normalizeStructuredUserContent(stripCacheControlDeep(m.content)) },
+          message: { role: "user" as const, content },
           parent_tool_use_id: null,
         })
-      } else {
-        // Drops tool_use blocks and skips tool-use-only assistant messages
-        // (flattenAssistantContent returns "" for those).
-        const assistantText = flattenAssistantContent(m.content)
-        if (assistantText) {
-          structured.push({
-            type: "user" as const,
-            message: { role: "user" as const, content: `[Assistant: ${assistantText}]` },
-            parent_tool_use_id: null,
-          })
-        }
+      }
+    } else {
+      // Drops tool_use blocks and skips tool-use-only assistant messages
+      // (flattenAssistantContent returns "" for those).
+      const assistantText = flattenAssistantContent(m.content)
+      if (assistantText) {
+        structured.push({
+          type: "user" as const,
+          message: { role: "user" as const, content: `[Assistant: ${assistantText}]` },
+          parent_tool_use_id: null,
+        })
       }
     }
-    return (async function* () { for (const msg of structured) yield msg })()
   }
-
-  return messages
-    .map((m) => {
-      const role = m.role === "assistant" ? "Assistant" : "Human"
-      const content = m.role === "assistant"
-        ? flattenAssistantContent(m.content)
-        : flattenUserContent(m.content, sanitizeOpts)
-      return content ? `${role}: ${content}` : ""
-    })
-    .filter(Boolean)
-    .join("\n\n") || ""
+  return (async function* () { for (const msg of structured) yield msg })()
 }
 
 // Routine [PROXY] operational logging. Suppressed when config.silent is set so
@@ -816,80 +820,56 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         messagesToConvert = allMessages
       }
 
-      // Check if any messages contain multimodal content (images, documents, files)
-      const hasMultimodal = messagesToConvert?.some((m: any) => hasMultimodalContent(m.content))
-
-      // Build the prompt — either structured (multimodal) or text.
-      // Structured prompts are stored as arrays so they can be replayed on retry.
-      let structuredMessages: Array<{ type: "user"; message: { role: string; content: any }; parent_tool_use_id: null }> | undefined
-      let textPrompt: string | undefined
-
-      if (hasMultimodal) {
-        // Structured messages preserve image/document/file blocks for Claude to see.
-        // On resume, only send user messages (SDK has assistant context already).
-        // On first request, include everything.
-        structuredMessages = []
-
-        if (isResume) {
-          // Resume: only send user messages from the delta (SDK has the rest)
-          for (const m of messagesToConvert) {
-            if (m.role === "user") {
-              structuredMessages.push({
-                type: "user" as const,
-                message: { role: "user" as const, content: normalizeStructuredUserContent(stripCacheControlDeep(m.content)) },
-                parent_tool_use_id: null,
-              })
-            }
+      // Always build a STREAM of discrete structured messages — never a flattened
+      // `Human: …\n\nAssistant: …` transcript. The flattened form ends in a
+      // dangling `Assistant:`/`Human:` transcript that the single-turn completion
+      // model happily continues on its own: it fabricates fake `Human:` turns and
+      // replies on the user's behalf (raw prompt labels leak into the reply and
+      // the conversation auto-advances — issues #111/#386 recur on the text path).
+      // Emitting discrete messages gives the model real turn boundaries instead of
+      // dangling text to continue.
+      //
+      // The SDK's streaming input only accepts USER messages, so assistant history
+      // is quoted as `[Assistant: …]` user turns. On resume the SDK already holds
+      // the prior turns, so only the (delta) user messages are sent; on a fresh
+      // request the full history is replayed. Multimodal user turns keep their
+      // structured image/doc/file blocks; text-only user turns run through
+      // flattenUserContent so orchestration-tag sanitize (sanitizeOpts) is kept.
+      const structuredMessages: Array<{ type: "user"; message: { role: string; content: any }; parent_tool_use_id: null }> = []
+      for (const m of messagesToConvert || []) {
+        if (m.role === "user") {
+          const content = hasMultimodalContent(m.content)
+            ? normalizeStructuredUserContent(stripCacheControlDeep(m.content))
+            : flattenUserContent(m.content, sanitizeOpts)
+          // Skip empty user turns (all blocks stripped -> "" or []).
+          const nonEmpty = typeof content === "string" ? content.length > 0 : Array.isArray(content) ? content.length > 0 : content != null
+          if (nonEmpty) {
+            structuredMessages.push({
+              type: "user" as const,
+              message: { role: "user" as const, content },
+              parent_tool_use_id: null,
+            })
           }
-        } else {
-          // First request: all messages (system context now passed via appendSystemPrompt)
-          for (const m of messagesToConvert) {
-            if (m.role === "user") {
-              structuredMessages.push({
-                type: "user" as const,
-                message: { role: "user" as const, content: normalizeStructuredUserContent(stripCacheControlDeep(m.content)) },
-                parent_tool_use_id: null,
-              })
-            } else {
-              // Drops tool_use blocks and skips tool-use-only assistant messages
-              // (flattenAssistantContent returns "" for those).
-              const assistantText = flattenAssistantContent(m.content)
-              if (assistantText) {
-                structuredMessages.push({
-                  type: "user" as const,
-                  message: { role: "user" as const, content: `[Assistant: ${assistantText}]` },
-                  parent_tool_use_id: null,
-                })
-              }
-            }
+        } else if (!isResume) {
+          // On resume the SDK already has the assistant context; only replay
+          // assistant history on a fresh request. Drops tool_use blocks and skips
+          // tool-use-only assistant messages (flattenAssistantContent returns "").
+          const assistantText = flattenAssistantContent(m.content)
+          if (assistantText) {
+            structuredMessages.push({
+              type: "user" as const,
+              message: { role: "user" as const, content: `[Assistant: ${assistantText}]` },
+              parent_tool_use_id: null,
+            })
           }
         }
-      } else {
-        // Text prompt — convert messages to string.
-        // Sanitize each text block before flattening to strip orchestration
-        // wrappers (<env>, <task_metadata>, etc.) that harnesses inject.
-        // `<system-reminder>` is only stripped for adapters that leak CWD
-        // through it (Droid) — preserved otherwise so that harness state
-        // like oh-my-opencode's background-task IDs reaches the model.
-        textPrompt = messagesToConvert
-          ?.map((m: { role: string; content: any }) => {
-            const role = m.role === "assistant" ? "Assistant" : "Human"
-            const content = m.role === "assistant"
-              ? flattenAssistantContent(m.content)
-              : flattenUserContent(m.content, sanitizeOpts)
-            return content ? `${role}: ${content}` : ""
-          })
-          .filter(Boolean)
-          .join("\n\n") || ""
       }
 
-      // Create a fresh prompt value — can be called multiple times for retry
+      // Create a fresh prompt value — can be called multiple times for retry.
+      // Always a discrete-message async stream (see the rationale above).
       function makePrompt(): string | AsyncIterable<any> {
-        if (structuredMessages) {
-          const msgs = structuredMessages
-          return (async function* () { for (const msg of msgs) yield msg })()
-        }
-        return textPrompt!
+        const msgs = structuredMessages
+        return (async function* () { for (const msg of msgs) yield msg })()
       }
 
       // --- Passthrough mode ---
