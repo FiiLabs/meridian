@@ -209,13 +209,27 @@ describe("Multimodal content", () => {
       messages.push(msg)
     }
 
-    // Should have all 3 messages (system context now in SDK option, not in prompt)
-    expect(messages.length).toBeGreaterThanOrEqual(3)
-    // All should have the user type wrapper (SDK requirement)
+    // Fresh path now emits a framed reference block for prior turns + the live
+    // user turn (2 items for this 3-message history). All are user-typed.
+    expect(messages.length).toBeGreaterThanOrEqual(2)
     for (const msg of messages) {
       expect(msg.type).toBe("user")
       expect(msg.message).toBeDefined()
+      expect(msg.message.role).toBe("user")
     }
+
+    // The reference block must PRESERVE the prior user turn's image (not drop it):
+    // it carries the real image block alongside the framed text.
+    const refBlock = messages.find(
+      (m) => Array.isArray(m.message.content) &&
+        m.message.content.some((b: any) => b.type === "text" && String(b.text).includes("Read-only record of earlier messages"))
+    )
+    expect(refBlock).toBeDefined()
+    expect(refBlock.message.content.some((b: any) => b.type === "image")).toBe(true)
+
+    // The LAST emitted item is the live user turn (current question).
+    const last = messages[messages.length - 1]
+    expect(last.message.content).toBe("what color is it?")
   })
 
   it("should strip cache_control from content blocks", async () => {

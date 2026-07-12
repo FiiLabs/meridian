@@ -227,6 +227,117 @@ function flattenUserContent(
 
 
 /**
+ * Fresh-path history replay, as a stream of discrete structured USER messages.
+ *
+ * Prior turns are collapsed into ONE framed "reference context" user turn, then
+ * the client's latest user turn is emitted preserved (multimodal-safe). This is
+ * the fix for the `[Assistant: …]` continuation leak: the previous approach
+ * replayed each assistant turn as its own `[Assistant: …]` user pseudo-turn, and
+ * a run of those reads to the single-turn completion model as a transcript to
+ * CONTINUE — so it fabricates the next assistant turn, inventing tool calls
+ * (`<invoke>`, "Command running in background with ID …") and `Human:`/`Assistant:`
+ * labels (issues #111/#386, and the prod leak reproduced 2026-07-11).
+ *
+ * A statistical A/B against a live seat proved the shapes: per-turn `[Assistant:]`
+ * replay leaks; the same history collapsed into one framed reference block does
+ * not — the block reads as notes that "already happened", and the LAST thing the
+ * model sees is the genuine current request, not a dangling assistant turn. So we
+ * frame history as read-only context instead of a transcript to continue.
+ *
+ * The SDK's streaming input only accepts user messages, hence both the reference
+ * block and the live turn are user turns (no assistant-role message is emitted).
+ * Prior turns are rendered to text in the reference block (with an "[Image
+ * attached]" placeholder inline), but any real image/document/file blocks from
+ * prior USER turns are carried along as structured attachments on the SAME
+ * reference user turn — so multimodal history is NOT lost, yet it still reads as
+ * inert reference rather than a transcript to continue. The LIVE user turn keeps
+ * its structured blocks. Text runs through flattenUserContent so orchestration-
+ * tag sanitize is kept.
+ */
+function buildFramedReferenceMessages(
+  messages: Array<{ role: string; content: any }>,
+  sanitizeOpts: import("./sanitize").SanitizeOptions = {}
+): Array<{ type: "user"; message: { role: string; content: any }; parent_tool_use_id: null }> {
+  const out: Array<{ type: "user"; message: { role: string; content: any }; parent_tool_use_id: null }> = []
+
+  // The live request is the last user turn; everything before it is history.
+  let liveIdx = -1
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role === "user") { liveIdx = i; break }
+  }
+
+  if (liveIdx < 0) {
+    // No user turn at all (pathological — clients always end on a user turn).
+    // Fall back to framing every turn so nothing is silently dropped.
+    liveIdx = messages.length
+  }
+
+  // Collapse prior turns into a single framed reference block.
+  if (liveIdx > 0) {
+    const lines: string[] = []
+    const priorMedia: any[] = [] // real image/document/file blocks from prior user turns
+    for (let i = 0; i < liveIdx; i++) {
+      const m = messages[i]
+      if (!m) continue
+      if (m.role === "user" && hasMultimodalContent(m.content)) {
+        // Preserve the actual media blocks as attachments; keep a text line so
+        // the transcript stays coherent.
+        for (const b of normalizeStructuredUserContent(stripCacheControlDeep(m.content))) {
+          if (b && typeof b === "object" && MULTIMODAL_TYPES.has(b.type)) priorMedia.push(b)
+        }
+      }
+      const text = m.role === "user"
+        ? flattenUserContent(m.content, sanitizeOpts)
+        : flattenAssistantContent(m.content)
+      if (!text) continue // skips tool-use-only assistant turns / emptied user turns
+      // Neutral archival entries — NOT a line-leading `User:`/`Assistant:`
+      // transcript, which reads as a live dialogue to continue. A numbered,
+      // inert digest (proven-clean A/B "notes" shape) keeps the who-said-what
+      // without inviting the model to write the next turn.
+      lines.push(`(${lines.length + 1}) ${m.role === "user" ? "user" : "assistant"}: ${text}`)
+    }
+    if (lines.length || priorMedia.length) {
+      const framed =
+        "[Read-only record of earlier messages in this conversation, provided for " +
+        "context only. These turns are already complete — do NOT continue, repeat, " +
+        "or re-run them, and do NOT emit tool calls on their behalf. Read them for " +
+        "background, then handle the new message that follows on its own terms.]\n\n" +
+        lines.join("\n\n") +
+        "\n\n[End of record. The new message to handle follows below.]"
+      // Text-only history → plain string; if prior turns had media, carry the
+      // real blocks alongside the framed text as a structured user turn.
+      const content = priorMedia.length
+        ? [{ type: "text", text: framed }, ...priorMedia]
+        : framed
+      out.push({
+        type: "user" as const,
+        message: { role: "user" as const, content },
+        parent_tool_use_id: null,
+      })
+    }
+  }
+
+  // Emit the live user turn, preserved (multimodal-safe).
+  const live = liveIdx >= 0 && liveIdx < messages.length ? messages[liveIdx] : undefined
+  if (live) {
+    const m = live
+    const content = hasMultimodalContent(m.content)
+      ? normalizeStructuredUserContent(stripCacheControlDeep(m.content))
+      : flattenUserContent(m.content, sanitizeOpts)
+    const nonEmpty = typeof content === "string" ? content.length > 0 : Array.isArray(content) ? content.length > 0 : content != null
+    if (nonEmpty) {
+      out.push({
+        type: "user" as const,
+        message: { role: "user" as const, content },
+        parent_tool_use_id: null,
+      })
+    }
+  }
+
+  return out
+}
+
+/**
  * Build a prompt from all messages for a fresh (non-resume) session.
  * Used when retrying after a stale session UUID error.
  */
@@ -234,46 +345,7 @@ function buildFreshPrompt(
   messages: Array<{ role: string; content: any }>,
   sanitizeOpts: import("./sanitize").SanitizeOptions = {}
 ): string | AsyncIterable<any> {
-  // Always replay history as a stream of DISCRETE structured messages rather
-  // than flattening it into one `Human: …\n\nAssistant: …` transcript string.
-  // The flattened form ends in an `Assistant:`/`Human:` transcript that the
-  // single-turn completion model continues on its own — fabricating fake
-  // `Human:` turns and replying on the user's behalf (leaks raw prompt labels
-  // and auto-advances the conversation, issues #111/#386 recur on the text
-  // path). Emitting discrete messages removes that transcript, so the model
-  // sees turn boundaries instead of dangling text to continue.
-  //
-  // The SDK's streaming input only accepts user messages, so assistant history
-  // is quoted as `[Assistant: …]` user turns (identical to the multimodal path
-  // that already ships). Text-only user turns still run through
-  // flattenUserContent so orchestration-tag sanitize (sanitizeOpts) is kept.
-  const structured: Array<{ type: "user"; message: { role: string; content: any }; parent_tool_use_id: null }> = []
-  for (const m of messages) {
-    if (m.role === "user") {
-      const content = hasMultimodalContent(m.content)
-        ? normalizeStructuredUserContent(stripCacheControlDeep(m.content))
-        : flattenUserContent(m.content, sanitizeOpts)
-      // Skip empty user turns (all blocks stripped -> "" or []).
-      if (typeof content === "string" ? content.length > 0 : content.length > 0) {
-        structured.push({
-          type: "user" as const,
-          message: { role: "user" as const, content },
-          parent_tool_use_id: null,
-        })
-      }
-    } else {
-      // Drops tool_use blocks and skips tool-use-only assistant messages
-      // (flattenAssistantContent returns "" for those).
-      const assistantText = flattenAssistantContent(m.content)
-      if (assistantText) {
-        structured.push({
-          type: "user" as const,
-          message: { role: "user" as const, content: `[Assistant: ${assistantText}]` },
-          parent_tool_use_id: null,
-        })
-      }
-    }
-  }
+  const structured = buildFramedReferenceMessages(messages, sanitizeOpts)
   return (async function* () { for (const msg of structured) yield msg })()
 }
 
@@ -820,24 +892,32 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         messagesToConvert = allMessages
       }
 
-      // Always build a STREAM of discrete structured messages — never a flattened
-      // `Human: …\n\nAssistant: …` transcript. The flattened form ends in a
-      // dangling `Assistant:`/`Human:` transcript that the single-turn completion
-      // model happily continues on its own: it fabricates fake `Human:` turns and
-      // replies on the user's behalf (raw prompt labels leak into the reply and
-      // the conversation auto-advances — issues #111/#386 recur on the text path).
-      // Emitting discrete messages gives the model real turn boundaries instead of
-      // dangling text to continue.
+      // Build a STREAM of discrete structured USER messages — never a flattened
+      // `Human: …\n\nAssistant: …` transcript, and never a run of per-turn
+      // `[Assistant: …]` pseudo-turns. Both forms read to the single-turn
+      // completion model as a transcript to CONTINUE: it fabricates the next
+      // assistant turn — inventing tool calls (`<invoke>`, "Command running in
+      // background with ID …") and `Human:`/`Assistant:` labels (#111/#386; the
+      // prod leak reproduced locally 2026-07-11).
       //
-      // The SDK's streaming input only accepts USER messages, so assistant history
-      // is quoted as `[Assistant: …]` user turns. On resume the SDK already holds
-      // the prior turns, so only the (delta) user messages are sent; on a fresh
-      // request the full history is replayed. Multimodal user turns keep their
-      // structured image/doc/file blocks; text-only user turns run through
-      // flattenUserContent so orchestration-tag sanitize (sanitizeOpts) is kept.
-      const structuredMessages: Array<{ type: "user"; message: { role: string; content: any }; parent_tool_use_id: null }> = []
-      for (const m of messagesToConvert || []) {
-        if (m.role === "user") {
+      // Fresh path (full history, no cached session): collapse prior turns into
+      // ONE framed reference-context block + the live user turn preserved. A/B
+      // against a live seat proved this shape does not leak while per-turn
+      // `[Assistant:]` replay does. See buildFramedReferenceMessages.
+      //
+      // Resume/undo path: messagesToConvert is a user-only delta (the SDK already
+      // holds prior turns), so emit those user turns as-is — no history to frame,
+      // no assistant turns to replay. Multimodal user turns keep their structured
+      // image/doc/file blocks; text runs through flattenUserContent so
+      // orchestration-tag sanitize (sanitizeOpts) is kept.
+      const isFreshFullReplay = !((isResume || isUndo) && cachedSession)
+      let structuredMessages: Array<{ type: "user"; message: { role: string; content: any }; parent_tool_use_id: null }>
+      if (isFreshFullReplay) {
+        structuredMessages = buildFramedReferenceMessages(messagesToConvert || [], sanitizeOpts)
+      } else {
+        structuredMessages = []
+        for (const m of messagesToConvert || []) {
+          if (m.role !== "user") continue // assistant context already held by the SDK on resume/undo
           const content = hasMultimodalContent(m.content)
             ? normalizeStructuredUserContent(stripCacheControlDeep(m.content))
             : flattenUserContent(m.content, sanitizeOpts)
@@ -847,18 +927,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             structuredMessages.push({
               type: "user" as const,
               message: { role: "user" as const, content },
-              parent_tool_use_id: null,
-            })
-          }
-        } else if (!isResume) {
-          // On resume the SDK already has the assistant context; only replay
-          // assistant history on a fresh request. Drops tool_use blocks and skips
-          // tool-use-only assistant messages (flattenAssistantContent returns "").
-          const assistantText = flattenAssistantContent(m.content)
-          if (assistantText) {
-            structuredMessages.push({
-              type: "user" as const,
-              message: { role: "user" as const, content: `[Assistant: ${assistantText}]` },
               parent_tool_use_id: null,
             })
           }

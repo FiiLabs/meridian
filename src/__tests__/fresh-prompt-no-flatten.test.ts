@@ -132,8 +132,34 @@ describe("fresh multi-turn prompt is never a flattened transcript", () => {
     }
 
     // The whole point: the user's own turns are NOT concatenated with the
-    // assistant turn into one transcript. We should see >= 2 discrete items
-    // (2 user turns + 1 quoted assistant turn) for this 3-message history.
+    // assistant turn into one dangling transcript. For this 3-message history
+    // the fresh path now emits a framed reference block + the live user turn.
     expect(items.length).toBeGreaterThanOrEqual(2)
+
+    // New framed-reference contract (fix for the [Assistant:] continuation leak):
+    //  - prior history is collapsed into ONE reference block explicitly marked
+    //    "for reference only … do NOT continue", never per-turn [Assistant:] wraps;
+    //  - the LAST emitted item is the genuine live user turn, so the model answers
+    //    it instead of continuing a transcript.
+    const strContents = items
+      .map((it) => it.message.content)
+      .filter((c): c is string => typeof c === "string")
+
+    // No legacy [Assistant: …] pseudo-turn wrapper anywhere.
+    for (const c of strContents) expect(c.includes("[Assistant:")).toBe(false)
+
+    // Exactly one framed reference block, and it carries the prior turns.
+    const framed = strContents.filter((c) => c.includes("Read-only record of earlier messages"))
+    expect(framed.length).toBe(1)
+    expect(framed[0]!).toContain("first question")
+    expect(framed[0]!).toContain("first answer")
+    expect(framed[0]!).toContain("do NOT continue")
+
+    // The last emitted item is the live user turn (the current question), and it
+    // is NOT the framed block.
+    const last = items[items.length - 1]!
+    expect(last.type).toBe("user")
+    expect(last.message.role).toBe("user")
+    expect(last.message.content).toBe("second question")
   })
 })
