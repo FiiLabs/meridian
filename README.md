@@ -109,7 +109,7 @@ Then in `~/.config/opencode/opencode.json`:
 
 # home-manager config
 {
-  imports = [ meridian.homeManagerModules.default ];
+  imports = [ meridian.homeModules.default ];
 
   services.meridian = {
     enable = true;
