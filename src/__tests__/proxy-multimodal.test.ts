@@ -72,7 +72,7 @@ describe("Multimodal content", () => {
     else delete process.env.MERIDIAN_PASSTHROUGH
   })
 
-  it("should use text prompt for text-only messages", async () => {
+  it("emits a discrete user-message stream for text-only messages", async () => {
     const app = createTestApp()
     await (await post(app, {
       model: "claude-sonnet-4-5",
@@ -81,7 +81,20 @@ describe("Multimodal content", () => {
       messages: [{ role: "user", content: "hello" }],
     })).json()
 
-    expect(typeof capturedQueryParams.prompt).toBe("string")
+    // Post-403e009 contract: the prompt is ALWAYS a discrete-message async
+    // stream, never a flattened string. A single text turn yields exactly one
+    // user message carrying the text.
+    expect(typeof capturedQueryParams.prompt).not.toBe("string")
+    expect(typeof capturedQueryParams.prompt[Symbol.asyncIterator]).toBe("function")
+
+    const messages: any[] = []
+    for await (const msg of capturedQueryParams.prompt) {
+      messages.push(msg)
+    }
+    expect(messages.length).toBe(1)
+    expect(messages[0].type).toBe("user")
+    expect(messages[0].message.role).toBe("user")
+    expect(messages[0].message.content).toBe("hello")
   })
 
   it("should use structured prompt for image content", async () => {
@@ -298,7 +311,7 @@ describe("Multimodal content", () => {
     expect(hasSystemMsg).toBe(false)
   })
 
-  it("should fall back to text prompt with image placeholder when no multimodal", async () => {
+  it("emits a discrete user-message stream for a text-only content array (no multimodal)", async () => {
     const app = createTestApp()
     await (await post(app, {
       model: "claude-sonnet-4-5",
@@ -307,7 +320,19 @@ describe("Multimodal content", () => {
       messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
     })).json()
 
-    expect(typeof capturedQueryParams.prompt).toBe("string")
-    expect(capturedQueryParams.prompt).toContain("hello")
+    // Post-403e009 contract: a text-only content array flattens to a single
+    // discrete user message (never a flattened string prompt). The text is
+    // preserved on that message's content.
+    expect(typeof capturedQueryParams.prompt).not.toBe("string")
+    expect(typeof capturedQueryParams.prompt[Symbol.asyncIterator]).toBe("function")
+
+    const messages: any[] = []
+    for await (const msg of capturedQueryParams.prompt) {
+      messages.push(msg)
+    }
+    expect(messages.length).toBe(1)
+    expect(messages[0].type).toBe("user")
+    expect(messages[0].message.role).toBe("user")
+    expect(messages[0].message.content).toBe("hello")
   })
 })
