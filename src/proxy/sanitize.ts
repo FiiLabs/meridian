@@ -113,3 +113,130 @@ export function sanitizeTextContent(text: string, opts: SanitizeOptions = {}): s
   result = result.replace(/\n{3,}/g, "\n\n")
   return result.trim()
 }
+
+// ===========================================================================
+// OUTPUT-side scrub: strip leaked harness scaffolding from the model's REPLY.
+//
+// On the fresh (non-resume) path the flattened history can make the model
+// PREPEND fabricated harness scaffolding to its answer instead of just
+// answering: a `<system-reminder>` block, an `[Assistant: …]` wrapper, bare
+// `Human:`/`Assistant:` role labels, or a numbered `(N) user:/assistant:`
+// transcript continuation (issues #111/#386/#496; reproduced on prod 2026-07-16
+// as a prepended `<system-reminder>` block). buildFramedReferenceMessages
+// reduces this at the SOURCE but does not fully eliminate it; this is the belt-
+// and-suspenders catch on the way OUT.
+//
+// Conservative by construction: only strips scaffolding at the LEADING edge of
+// the reply (where the leak appears), looping until the head is clean. Body
+// content is never touched, so a reply that legitimately mentions these tokens
+// later on is fully preserved.
+// ===========================================================================
+
+// Leading scaffolding patterns, anchored to the START of the (left-trimmed) reply.
+const LEADING_SCAFFOLD_PATTERNS: RegExp[] = [
+  // Fabricated harness context blocks (paired tags) at the head.
+  /^<system-reminder\b[^>]*>[\s\S]*?<\/system-reminder>/i,
+  /^<(env|task_metadata|thinking|tool_output|tool_exec|skill_content)\b[^>]*>[\s\S]*?<\/\1>/i,
+  // Classic `[Assistant: …]` / `[Human: …]` wrapper leak (single line).
+  /^\[(assistant|human)\b[^\]\n]*\]?/i,
+  // Bare role label at the very start of the reply.
+  /^(assistant|human|user)\s*[:：][ \t]*/i,
+  // Numbered transcript-continuation marker: "(31) assistant:" / "(1) user:".
+  /^\(\s*\d+\s*\)\s*(assistant|user|human)\s*[:：][ \t]*/i,
+]
+
+/**
+ * Strip leaked harness scaffolding from the LEADING edge of a reply. Loops so a
+ * stacked leak (e.g. a `<system-reminder>` block followed by a role label) is
+ * fully removed. Returns the cleaned text (left-trimmed).
+ */
+export function scrubResponseText(text: string): string {
+  if (!text) return text
+  let out = text.replace(/^\s+/, "")
+  for (let changed = true; changed; ) {
+    changed = false
+    for (const re of LEADING_SCAFFOLD_PATTERNS) {
+      const m = out.match(re)
+      if (m && m.index === 0 && m[0].length > 0) {
+        out = out.slice(m[0].length).replace(/^\s+/, "")
+        changed = true
+        break
+      }
+    }
+  }
+  return out
+}
+
+// Prefixes whose appearance at the head of a reply means it MIGHT be leaked
+// scaffolding — the only case the streaming scrubber buffers for. Anything else
+// streams through untouched (zero added latency on the common path).
+const SCAFFOLD_OPENERS = [
+  "<system-reminder",
+  "<env",
+  "<task_metadata",
+  "<thinking",
+  "<tool_output",
+  "<tool_exec",
+  "<skill_content",
+  "[assistant",
+  "[human",
+  "assistant:",
+  "human:",
+  "user:",
+]
+
+/**
+ * True when `head` (a left-trimmed leading slice of a streamed reply) could
+ * still be the beginning of leaked scaffolding — i.e. it is a prefix of, or
+ * starts with, a known opener, or looks like a numbered "(N) role:" marker.
+ * Used by the streaming scrubber to decide whether to keep buffering the head.
+ */
+export function couldBeScaffoldPrefix(head: string): boolean {
+  const s = head.replace(/^\s+/, "").toLowerCase()
+  if (s === "") return true // only whitespace so far — undecided
+  if (/^\(\s*\d/.test(s)) return true // "(3" → possible numbered marker
+  if (/^\(\s*$/.test(s)) return true // just "(" — could become "(3)"
+  return SCAFFOLD_OPENERS.some((o) => o.startsWith(s) || s.startsWith(o))
+}
+
+/**
+ * Stateful scrubber for a STREAMED reply's first text block. Buffers only while
+ * the head could still be leaked scaffolding; once the head is known-clean it
+ * resolves and passes every subsequent chunk through verbatim.
+ */
+export function makeLeadingScrubber() {
+  let buf = ""
+  let resolved = false
+  return {
+    /** Feed a text delta. Returns text to emit now (possibly ""), or null to
+     *  withhold this chunk (still buffering the head). */
+    feed(chunk: string): string | null {
+      if (resolved) return chunk
+      buf += chunk
+      if (couldBeScaffoldPrefix(buf)) {
+        const scrubbed = scrubResponseText(buf)
+        // Fully stripped AND the remainder is no longer scaffold-like → resolve.
+        if (scrubbed !== buf && !couldBeScaffoldPrefix(scrubbed)) {
+          resolved = true
+          buf = ""
+          return scrubbed
+        }
+        return null // incomplete/ambiguous — keep buffering
+      }
+      // Head is definitively NOT scaffolding → flush and pass through hereafter.
+      resolved = true
+      const out = buf
+      buf = ""
+      return out
+    },
+    /** Called when the head text block ends — flush whatever is buffered,
+     *  scrubbed. Returns "" if nothing to emit. */
+    flush(): string {
+      if (resolved) return ""
+      resolved = true
+      const out = scrubResponseText(buf)
+      buf = ""
+      return out
+    },
+  }
+}

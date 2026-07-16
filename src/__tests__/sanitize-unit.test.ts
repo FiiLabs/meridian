@@ -9,7 +9,12 @@
  */
 
 import { describe, it, expect } from "bun:test"
-import { sanitizeTextContent } from "../proxy/sanitize"
+import {
+  sanitizeTextContent,
+  scrubResponseText,
+  couldBeScaffoldPrefix,
+  makeLeadingScrubber,
+} from "../proxy/sanitize"
 
 // ── Orchestration tag stripping ──
 
@@ -223,5 +228,104 @@ describe("sanitizeTextContent", () => {
     expect(result).toContain("[ALL BACKGROUND TASKS COMPLETE]")
     // OMO comment still stripped (unambiguous orchestration marker)
     expect(result).not.toContain("OMO_INTERNAL_INITIATOR")
+  })
+})
+
+// ── OUTPUT-side scrub: leaked scaffolding in the model's REPLY ──
+
+describe("scrubResponseText", () => {
+  it("strips a prepended <system-reminder> block (the reproduced prod leak)", () => {
+    const input =
+      "<system-reminder>\nThis is the start of a new conversation. Any previous conversation was ended. The user isn't available right now, so you should NOT ask questions.\n</system-reminder>\n刚才 proxylite 隧道的排查过程和结论如下: ..."
+    const out = scrubResponseText(input)
+    expect(out.startsWith("刚才 proxylite")).toBe(true)
+    expect(out).not.toContain("<system-reminder>")
+    expect(out).not.toContain("start of a new conversation")
+  })
+
+  it("strips a classic [Assistant: …] wrapper leak at the head", () => {
+    expect(scrubResponseText("[Assistant: prior turn text]\nHere is the answer.")).toBe("Here is the answer.")
+  })
+
+  it("strips leading bare role labels", () => {
+    expect(scrubResponseText("Assistant: the real answer")).toBe("the real answer")
+    expect(scrubResponseText("Human: fabricated user turn")).toBe("fabricated user turn")
+  })
+
+  it("strips a numbered transcript-continuation marker", () => {
+    expect(scrubResponseText("(31) assistant: continued turn")).toBe("continued turn")
+  })
+
+  it("strips STACKED scaffolding (block + label) in one pass", () => {
+    const input = "<system-reminder>x</system-reminder>\nAssistant: the answer"
+    expect(scrubResponseText(input)).toBe("the answer")
+  })
+
+  it("leaves a normal reply untouched", () => {
+    const normal = "当然可以,我帮你排查一下 proxylite 隧道。首先确认机器还活着。"
+    expect(scrubResponseText(normal)).toBe(normal)
+  })
+
+  it("does NOT strip a mid-body mention of <system-reminder>", () => {
+    const input = "The harness injects a `<system-reminder>` tag like this:\n<system-reminder>x</system-reminder>"
+    expect(scrubResponseText(input)).toBe(input)
+  })
+
+  it("preserves a reply that legitimately starts with code containing <", () => {
+    const code = "<div>hello</div> is HTML."
+    expect(scrubResponseText(code)).toBe(code)
+  })
+})
+
+describe("couldBeScaffoldPrefix", () => {
+  it("is true for partial and full scaffold openers", () => {
+    expect(couldBeScaffoldPrefix("<sys")).toBe(true)
+    expect(couldBeScaffoldPrefix("<system-reminder>")).toBe(true)
+    expect(couldBeScaffoldPrefix("[Assist")).toBe(true)
+    expect(couldBeScaffoldPrefix("(3")).toBe(true)
+    expect(couldBeScaffoldPrefix("(")).toBe(true)
+    expect(couldBeScaffoldPrefix("Assistant:")).toBe(true)
+  })
+  it("is false once the head is clearly normal prose", () => {
+    expect(couldBeScaffoldPrefix("当然可以")).toBe(false)
+    expect(couldBeScaffoldPrefix("(hello)")).toBe(false)
+    expect(couldBeScaffoldPrefix("<div>")).toBe(false)
+    expect(couldBeScaffoldPrefix("The answer is")).toBe(false)
+  })
+})
+
+describe("makeLeadingScrubber (streaming head)", () => {
+  function runStream(chunks: string[]): string {
+    const s = makeLeadingScrubber()
+    let out = ""
+    for (const c of chunks) {
+      const emit = s.feed(c)
+      if (emit !== null) out += emit
+    }
+    out += s.flush()
+    return out
+  }
+
+  it("strips a system-reminder block streamed across many deltas", () => {
+    const chunks = ["<system", "-reminder>\nThis is the start", " of a new conversation.\n</system-", "reminder>\n", "刚才", "的结论如下"]
+    expect(runStream(chunks)).toBe("刚才的结论如下")
+  })
+
+  it("passes a normal reply through untouched with no buffering surprises", () => {
+    const chunks = ["当然", "可以,", "我帮你排查。"]
+    expect(runStream(chunks)).toBe("当然可以,我帮你排查。")
+  })
+
+  it("resolves quickly when head starts with '(' but is not numbered", () => {
+    expect(runStream(["(", "hello) world"]) ).toBe("(hello) world")
+  })
+
+  it("strips a streamed leading role label", () => {
+    expect(runStream(["Assist", "ant: ", "the real answer"])).toBe("the real answer")
+  })
+
+  it("flushes an unterminated system-reminder unchanged (no closing tag)", () => {
+    const out = runStream(["<system-reminder>never closes and here is content"])
+    expect(out).toContain("never closes and here is content")
   })
 })

@@ -68,6 +68,32 @@ async function post(app: any, body: any) {
   }))
 }
 
+// Extract the full text of a captured SDK prompt. Handles both the RESUME
+// path (plain string) and the FRESH path (structured async-iterable yielding
+// `{ type:"user", message:{ role, content }, parent_tool_use_id }` items whose
+// content is a string or an array of text blocks). Iterating is async, so this
+// is async and callers must await it.
+async function extractPromptText(prompt: any): Promise<string> {
+  if (typeof prompt === "string") return prompt
+  if (prompt == null) return ""
+  // Structured async-iterable (buildFramedReferenceMessages generator).
+  if (typeof prompt[Symbol.asyncIterator] === "function" || typeof prompt[Symbol.iterator] === "function") {
+    const parts: string[] = []
+    for await (const item of prompt) {
+      const content = item?.message?.content
+      if (typeof content === "string") {
+        parts.push(content)
+      } else if (Array.isArray(content)) {
+        for (const block of content) {
+          if (block?.type === "text" && typeof block.text === "string") parts.push(block.text)
+        }
+      }
+    }
+    return parts.join("\n")
+  }
+  return ""
+}
+
 async function readStream(response: Response): Promise<string> {
   const reader = response.body!.getReader()
   const decoder = new TextDecoder()
@@ -163,9 +189,10 @@ describe("Integration: Full Anthropic API tool loop", () => {
     expect(body.content[0].type).toBe("text")
     expect(body.content[0].text).toContain("meridian")
 
-    // Verify the prompt includes the tool result
-    expect(capturedQueryParams.prompt).toContain("meridian")
-    expect(capturedQueryParams.prompt).toContain("1.1.0")
+    // Verify the prompt includes the tool result (fresh path → structured async-iterable)
+    const promptText = await extractPromptText(capturedQueryParams.prompt)
+    expect(promptText).toContain("meridian")
+    expect(promptText).toContain("1.1.0")
   })
 
   it("Step 3: Error tool_result → Claude recovers", async () => {
@@ -196,7 +223,9 @@ describe("Integration: Full Anthropic API tool loop", () => {
     // Claude should recover with a new tool call or text
     expect(body.content.length).toBeGreaterThanOrEqual(1)
     // The prompt should contain the error so Claude can learn from it
-    expect(capturedQueryParams.prompt).toContain("Unknown agent type")
+    // (fresh path → structured async-iterable)
+    const promptText = await extractPromptText(capturedQueryParams.prompt)
+    expect(promptText).toContain("Unknown agent type")
   })
 })
 

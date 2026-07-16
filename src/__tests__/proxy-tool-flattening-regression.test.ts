@@ -88,14 +88,29 @@ async function postWithSession(
   await response.json()
 }
 
-function promptToString(prompt: unknown): string {
+// The fresh (non-resume) path now yields a STRUCTURED stream of user messages
+// (framed reference block + live user turn) instead of a single text string.
+// Flatten either shape to text so the assertions can inspect what the SDK saw.
+async function promptToString(prompt: unknown): Promise<string> {
   if (typeof prompt === "string") return prompt
+  if (prompt && typeof (prompt as any)[Symbol.asyncIterator] === "function") {
+    let out = ""
+    for await (const item of prompt as AsyncIterable<any>) {
+      const content = item?.message?.content
+      if (typeof content === "string") out += (out ? "\n\n" : "") + content
+      else if (Array.isArray(content)) {
+        const t = content.filter((b: any) => b?.type === "text" && b.text).map((b: any) => b.text).join("\n")
+        if (t) out += (out ? "\n\n" : "") + t
+      }
+    }
+    return out
+  }
   return ""
 }
 
 /** Assert the SDK prompt contains no flattened tool-use strings */
-function assertNoFlattenedToolBlocks(prompt: unknown) {
-  const s = promptToString(prompt)
+async function assertNoFlattenedToolBlocks(prompt: unknown) {
+  const s = await promptToString(prompt)
   expect(s).not.toContain("[Tool Use:")
   expect(s).not.toContain("[Tool Result")
   expect(s).not.toContain("[Tool Result for")
@@ -143,7 +158,7 @@ describe("Issue #386 — tool_use blocks must not leak into SDK prompt as text",
 
     // Must resume (lineage=continuation) and must not have flattened tool blocks into text
     expect(getCaptured()?.options?.resume).toBe("sdk-continue")
-    assertNoFlattenedToolBlocks(getCaptured()?.prompt)
+    await assertNoFlattenedToolBlocks(getCaptured()?.prompt)
   })
 
   it("headered session: proxy restart (cache cleared) must still rehydrate without flattening", async () => {
@@ -163,7 +178,7 @@ describe("Issue #386 — tool_use blocks must not leak into SDK prompt as text",
 
     // After restart, shared-store lookup should find the session → continuation
     // (delta only). Critically, tool_use/tool_result must NOT leak as text.
-    assertNoFlattenedToolBlocks(getCaptured()?.prompt)
+    await assertNoFlattenedToolBlocks(getCaptured()?.prompt)
   })
 
   it("headered session: new session header on rehydration (session lost) must not flatten", async () => {
@@ -180,7 +195,7 @@ describe("Issue #386 — tool_use blocks must not leak into SDK prompt as text",
 
     // This is where fingerprint fallback would have saved us in the old code.
     // Whatever the final lineage decision, tool_use blocks must not be flattened.
-    assertNoFlattenedToolBlocks(getCaptured()?.prompt)
+    await assertNoFlattenedToolBlocks(getCaptured()?.prompt)
   })
 
   it("headerless session: full rehydration path must not flatten tool_use blocks", async () => {
@@ -213,7 +228,7 @@ describe("Issue #386 — tool_use blocks must not leak into SDK prompt as text",
       }),
     })).then(r => r.json())
 
-    assertNoFlattenedToolBlocks(getCaptured()?.prompt)
+    await assertNoFlattenedToolBlocks(getCaptured()?.prompt)
   })
 })
 
@@ -256,7 +271,7 @@ describe("tool-result attribution on full-history replay (#552)", () => {
     const app = createTestApp()
     await postWithSession(app, "attribution-session-1", toolLoopHistory, "sdk-attr-1")
 
-    const prompt = promptToString(getCaptured()?.prompt)
+    const prompt = await promptToString(getCaptured()?.prompt)
     // The write result must be attributed WITH its content — the model must be
     // able to recognize its own work product, not just an unexplained success
     // string (#552 gave it the target; the #496 follow-up adds the content, so
@@ -267,7 +282,7 @@ describe("tool-result attribution on full-history replay (#552)", () => {
     // for non-mutating tools).
     expect(prompt).toContain("[your read tmp/test1.txt]")
     // And the banned verbose shapes must stay banned.
-    assertNoFlattenedToolBlocks(getCaptured()?.prompt)
+    await assertNoFlattenedToolBlocks(getCaptured()?.prompt)
   })
 
   it("replays edit calls with a truncated summary of what changed (#496 follow-up)", async () => {
@@ -295,13 +310,13 @@ describe("tool-result attribution on full-history replay (#552)", () => {
     ]
     await postWithSession(app, "attribution-session-2", editHistory, "sdk-attr-2")
 
-    const prompt = promptToString(getCaptured()?.prompt)
+    const prompt = await promptToString(getCaptured()?.prompt)
     // The model must see WHAT it inserted, whitespace-collapsed, so it can
     // recognize its own wording later instead of concluding "the first
     // variant of the comments isn't mine" (stefanpartheym's #496 transcript).
     expect(prompt).toContain('[your edit .github/dependabot.yml → "open-pull-requests-limit: 10 ignore: # Major bumps need manual review')
     expect(prompt).toContain("Edit applied successfully.")
-    assertNoFlattenedToolBlocks(getCaptured()?.prompt)
+    await assertNoFlattenedToolBlocks(getCaptured()?.prompt)
   })
 })
 
@@ -335,7 +350,7 @@ describe("transcript-format imitation (#496 self-talk regression)", () => {
     ], "sdk-selftalk")
 
     expect(getCaptured()?.options?.resume).toBe("sdk-selftalk")
-    const prompt = promptToString(getCaptured()?.prompt)
+    const prompt = await promptToString(getCaptured()?.prompt)
     expect(prompt).not.toMatch(transcriptMarker)
     // The assistant's delta text must NOT be replayed — the resumed SDK
     // session already contains that turn; re-sending it as user text is the
@@ -346,7 +361,7 @@ describe("transcript-format imitation (#496 self-talk regression)", () => {
     expect(prompt).toContain("[your edit a.yml")
   })
 
-  it("fresh multi-turn replay: assistant turns bracketed, no transcript markers", async () => {
+  it("fresh multi-turn replay: history framed as inert reference, no transcript markers", async () => {
     const app = createTestApp()
     capturedParams = null
     // New session header + full history → fresh replay of a text conversation
@@ -356,11 +371,14 @@ describe("transcript-format imitation (#496 self-talk regression)", () => {
       { role: "user", content: "and of Germany?" },
     ], "sdk-selftalk-fresh")
 
-    const prompt = promptToString(getCaptured()?.prompt)
+    const prompt = await promptToString(getCaptured()?.prompt)
     expect(prompt).not.toMatch(transcriptMarker)
-    // Assistant context survives in the bracketed, non-imitatable shape the
-    // structured path has used since #553.
-    expect(prompt).toContain("[Assistant: Paris.]")
+    // Assistant context survives inside the inert, non-imitatable framed record
+    // (numbered "(N) assistant: ..." digest), NOT as a live "[Assistant: ...]"
+    // transcript the model would continue.
+    expect(prompt).toContain("Read-only record of earlier messages")
+    expect(prompt).toContain("assistant: Paris.")
+    expect(prompt).not.toContain("[Assistant: Paris.]")
     expect(prompt).toContain("what is the capital of France?")
     expect(prompt).toContain("and of Germany?")
   })

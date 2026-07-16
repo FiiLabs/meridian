@@ -72,6 +72,30 @@ async function postMessages(app: any, body: Record<string, unknown>) {
   return app.fetch(req)
 }
 
+// Extract the plain-text of a prompt sent to the SDK. The FRESH (non-resume)
+// path now sends a STRUCTURED async-iterable of
+// `{ type:"user", message:{ role:"user", content }, parent_tool_use_id:null }`
+// items instead of a flat text string. Pull text from each item's
+// message.content (string, or array → join text-block `.text`).
+async function extractPromptText(prompt: any): Promise<string> {
+  if (typeof prompt === "string") return prompt
+  if (prompt != null && typeof prompt[Symbol.asyncIterator] === "function") {
+    const parts: string[] = []
+    for await (const item of prompt) {
+      const content = item?.message?.content
+      if (typeof content === "string") {
+        parts.push(content)
+      } else if (Array.isArray(content)) {
+        for (const block of content) {
+          if (block && typeof block.text === "string") parts.push(block.text)
+        }
+      }
+    }
+    return parts.join("\n\n")
+  }
+  throw new Error(`Unexpected prompt shape: ${typeof prompt}`)
+}
+
 async function readStreamFull(response: Response): Promise<string> {
   const reader = response.body!.getReader()
   const decoder = new TextDecoder()
@@ -204,9 +228,8 @@ describe("Phase 2: Message format preservation", () => {
       append: "You are a helpful assistant.",
     })
     // Prompt text should NOT contain the system context (it's in the SDK option now)
-    const prompt = capturedQueryParams.prompt
-    expect(typeof prompt).toBe("string")
-    expect(prompt).not.toContain("You are a helpful assistant.")
+    const promptText = await extractPromptText(capturedQueryParams.prompt)
+    expect(promptText).not.toContain("You are a helpful assistant.")
   })
 
   it("should include tool_result content in the prompt sent to SDK", async () => {
@@ -226,6 +249,7 @@ describe("Phase 2: Message format preservation", () => {
 
     // The prompt sent to SDK should include the tool result context
     expect(capturedQueryParams).toBeDefined()
-    expect(capturedQueryParams.prompt).toContain("file contents here")
+    const promptText = await extractPromptText(capturedQueryParams.prompt)
+    expect(promptText).toContain("file contents here")
   })
 })

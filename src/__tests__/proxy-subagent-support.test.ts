@@ -72,6 +72,29 @@ async function postMessages(app: any, body: Record<string, unknown>) {
   return app.fetch(req)
 }
 
+// The FRESH (non-resume) prompt path no longer renders history as a plain
+// string. It yields a structured async-iterable of
+// `{ type:"user", message:{ role:"user", content }, parent_tool_use_id:null }`
+// items (buildFramedReferenceMessages): a framed read-only reference block for
+// prior history followed by the live user turn. Flatten it back to text so the
+// content/attribution assertions can inspect what the model actually receives.
+async function extractPromptText(prompt: any): Promise<string> {
+  if (prompt == null) return ""
+  if (typeof prompt === "string") return prompt
+  const parts: string[] = []
+  for await (const item of prompt as AsyncIterable<any>) {
+    const content = item?.message?.content
+    if (typeof content === "string") {
+      parts.push(content)
+    } else if (Array.isArray(content)) {
+      for (const block of content) {
+        if (block?.type === "text" && typeof block.text === "string") parts.push(block.text)
+      }
+    }
+  }
+  return parts.join("\n\n")
+}
+
 async function readStreamFull(response: Response): Promise<string> {
   const reader = response.body!.getReader()
   const decoder = new TextDecoder()
@@ -185,8 +208,14 @@ describe("Phase 3: Tool result in follow-up requests", () => {
     }))
     await response.json()
 
-    const prompt = capturedQueryParams.prompt
-    // Should contain the tool use context
+    // tool_use JSON has always been dropped from the flattened prompt (both the
+    // old `[Assistant: …]` path and the new framed reference block) — the model
+    // gets tool_use via structured SDK state. What must survive is the
+    // tool_result attribution: flattenUserContent labels the replayed result
+    // with `[your <tool> <target>]`, so the Read/test.ts attribution and the
+    // result body are all present in the reference-block text.
+    const prompt = await extractPromptText(capturedQueryParams.prompt)
+    // Should contain the tool use context (via result attribution label)
     expect(prompt).toContain("Read")
     expect(prompt).toContain("test.ts")
     // Should contain the tool result
@@ -221,7 +250,7 @@ describe("Phase 3: Tool result in follow-up requests", () => {
     }))
     await response.json()
 
-    const prompt = capturedQueryParams.prompt
+    const prompt = await extractPromptText(capturedQueryParams.prompt)
     expect(prompt).toContain("file a contents")
     expect(prompt).toContain("file b contents")
   })
@@ -252,7 +281,7 @@ describe("Phase 3: Tool result in follow-up requests", () => {
     }))
     await response.json()
 
-    const prompt = capturedQueryParams.prompt
+    const prompt = await extractPromptText(capturedQueryParams.prompt)
     expect(prompt).toContain("Unknown agent type")
     expect(prompt).toContain("general-purpose")
   })

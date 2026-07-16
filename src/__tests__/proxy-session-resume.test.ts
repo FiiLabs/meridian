@@ -442,9 +442,46 @@ describe("Session resume: only send last user message on resume", () => {
       ],
     }, { "x-opencode-session": "oc-new-session" })).json()
 
-    // No resume — should include full history
-    expect(capturedQueryParams.prompt).toContain("First message")
-    expect(capturedQueryParams.prompt).toContain("Second message")
+    // No resume — the FRESH path now returns a STRUCTURED async-iterable
+    // (buildFramedReferenceMessages): item 1 is a framed read-only "reference"
+    // user message holding prior turns as `(N) user:`/`(N) assistant:` lines,
+    // item 2 is the live/last user turn preserved. Flatten every yielded item's
+    // text so we can assert the FULL history reached the SDK (not just the last).
+    const { prompt } = capturedQueryParams
+    let flattened: string
+    let itemCount = 0
+    if (typeof prompt === "string") {
+      flattened = prompt
+      itemCount = 1
+    } else {
+      const parts: string[] = []
+      for await (const item of prompt) {
+        itemCount++
+        const content = item?.message?.content
+        if (typeof content === "string") {
+          parts.push(content)
+        } else if (Array.isArray(content)) {
+          for (const block of content) {
+            if (block && typeof block.text === "string") parts.push(block.text)
+          }
+        }
+      }
+      flattened = parts.join("\n")
+    }
+
+    // Full history is present: earlier user turn, earlier assistant turn, AND
+    // the live/last user turn all reach the SDK.
+    expect(flattened).toContain("First message")
+    expect(flattened).toContain("Response") // earlier assistant turn — now `(N) assistant: ...`
+    expect(flattened).toContain("Second message") // live/last user turn
+    // Assistant history is framed as `(N) assistant:` inside the reference
+    // record — NOT the old `[Assistant: ...]` text nor a Human:/Assistant:
+    // live transcript.
+    expect(flattened).not.toContain("[Assistant:")
+    expect(flattened).toContain("assistant: Response")
+    // It sends MORE than just the last message (framed reference + live turn),
+    // and it is genuinely a fresh request, not a resume.
+    expect(itemCount).toBeGreaterThan(1)
     expect(capturedQueryParams.options.resume).toBeUndefined()
   })
 })

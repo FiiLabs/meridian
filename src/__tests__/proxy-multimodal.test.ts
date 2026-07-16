@@ -59,6 +59,30 @@ async function post(app: any, body: any) {
   }))
 }
 
+// Drain a structured (async-iterable) prompt into flat views:
+//   items    — the raw { type:"user", message, parent_tool_use_id } wrappers
+//   texts    — every text string, per source (string content, or text blocks)
+//   combined — all text joined, for whole-prompt substring assertions
+//   media    — every non-text content block (image/document/file/...)
+async function collectPrompt(prompt: any) {
+  const items: any[] = []
+  for await (const msg of prompt) items.push(msg)
+  const texts: string[] = []
+  const media: any[] = []
+  for (const it of items) {
+    const content = it.message?.content
+    if (typeof content === "string") {
+      texts.push(content)
+    } else if (Array.isArray(content)) {
+      for (const b of content) {
+        if (b?.type === "text" && typeof b.text === "string") texts.push(b.text)
+        else if (b && typeof b === "object" && b.type) media.push(b)
+      }
+    }
+  }
+  return { items, texts, combined: texts.join("\n"), media }
+}
+
 describe("Multimodal content", () => {
   beforeEach(() => {
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
@@ -72,16 +96,40 @@ describe("Multimodal content", () => {
     else delete process.env.MERIDIAN_PASSTHROUGH
   })
 
-  it("should use text prompt for text-only messages", async () => {
+  it("uses a structured framed-reference prompt for text-only history (no loss)", async () => {
     const app = createTestApp()
     await (await post(app, {
       model: "claude-sonnet-4-5",
       max_tokens: 1024,
       stream: false,
-      messages: [{ role: "user", content: "hello" }],
+      messages: [
+        { role: "user", content: "hello" },
+        { role: "assistant", content: "hi there, how can I help?" },
+        { role: "user", content: "what is 2+2?" },
+      ],
     })).json()
 
-    expect(typeof capturedQueryParams.prompt).toBe("string")
+    // FRESH text-only history is now STRUCTURED (async-iterable), not a raw
+    // string transcript. The old `[Assistant: …]` string form is gone.
+    expect(typeof capturedQueryParams.prompt).not.toBe("string")
+    expect(capturedQueryParams.prompt[Symbol.asyncIterator]).toBeDefined()
+
+    const { items, combined, texts } = await collectPrompt(capturedQueryParams.prompt)
+
+    // Prior turns collapse into an inert framed "read-only record"...
+    expect(combined).toContain("[Read-only record of earlier messages")
+    expect(combined).toContain("[End of record.")
+    // ...with the assistant rendered as a numbered digest entry `(N) assistant: …`,
+    // NOT the continuable `[Assistant: …]` wrapper that seeded the leak.
+    expect(combined).toContain("assistant: hi there, how can I help?")
+    expect(combined).not.toContain("[Assistant:")
+    // Prior user content survives the collapse too.
+    expect(combined).toContain("user: hello")
+    // The genuine latest user turn is emitted as its own live message.
+    expect(texts.some((t) => t === "what is 2+2?")).toBe(true)
+    // Everything is wrapped as an SDK user message.
+    expect(items.length).toBeGreaterThanOrEqual(2)
+    for (const it of items) expect(it.type).toBe("user")
   })
 
   it("should use structured prompt for image content", async () => {
@@ -239,19 +287,27 @@ describe("Multimodal content", () => {
       ],
     })).json()
 
-    // Collect all messages from the async iterable
-    const messages: any[] = []
-    for await (const msg of capturedQueryParams.prompt) {
-      messages.push(msg)
-    }
+    const { items, combined, texts, media } = await collectPrompt(capturedQueryParams.prompt)
 
-    // Should have all 3 messages (system context now in SDK option, not in prompt)
-    expect(messages.length).toBeGreaterThanOrEqual(3)
+    // Prior turns collapse into ONE framed reference message; the live user turn
+    // is emitted separately → 2 SDK user messages (was 3 discrete role messages).
+    expect(items.length).toBe(2)
     // All should have the user type wrapper (SDK requirement)
-    for (const msg of messages) {
+    for (const msg of items) {
       expect(msg.type).toBe("user")
       expect(msg.message).toBeDefined()
     }
+
+    // Every role's content still survives, now as numbered digest entries plus
+    // the live turn: the earlier user turn...
+    expect(combined).toContain("user: look at this")
+    // ...the assistant turn...
+    expect(combined).toContain("assistant: I see it")
+    // ...and the final live user turn, preserved verbatim.
+    expect(texts.some((t) => t === "what color is it?")).toBe(true)
+    // The earlier-turn image rides onto the reference message so multimodal is
+    // not lost when its role collapses into the digest.
+    expect(media.some((b) => b.type === "image" && b.source?.data === "abc")).toBe(true)
   })
 
   it("should strip cache_control from content blocks", async () => {
@@ -320,16 +376,27 @@ describe("Multimodal content", () => {
     expect(hasSystemMsg).toBe(false)
   })
 
-  it("should fall back to text prompt with image placeholder when no multimodal", async () => {
+  it("degrades a prior-turn image to an [Image attached] placeholder in the structured reference text", async () => {
     const app = createTestApp()
     await (await post(app, {
       model: "claude-sonnet-4-5",
       max_tokens: 1024,
       stream: false,
-      messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+      messages: [
+        { role: "user", content: [{ type: "text", text: "here is a picture" }, { type: "image", source: { type: "base64", media_type: "image/png", data: "IMG" } }] },
+        { role: "assistant", content: "got it" },
+        { role: "user", content: "thanks" },
+      ],
     })).json()
 
-    expect(typeof capturedQueryParams.prompt).toBe("string")
-    expect(capturedQueryParams.prompt).toContain("hello")
+    // FRESH path is structured now, but the earlier-turn image still degrades to
+    // an "[Image attached]" placeholder inside the framed reference TEXT digest
+    // (the digest can't inline real media), exactly as the string path did before.
+    expect(typeof capturedQueryParams.prompt).not.toBe("string")
+    const { combined, texts } = await collectPrompt(capturedQueryParams.prompt)
+    expect(combined).toContain("here is a picture")
+    expect(combined).toContain("[Image attached]")
+    // The live user turn text still flows through.
+    expect(texts.some((t) => t === "thanks")).toBe(true)
   })
 })

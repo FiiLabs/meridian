@@ -70,10 +70,40 @@ Use \`background_output(task_id="<id>")\` to retrieve each result.
 <!-- OMO_INTERNAL_INITIATOR -->
 11:41 AM`
 
-function getPromptText(): string {
+// Pull the concatenated user text out of a captured SDK prompt. The fresh
+// (non-resume) path now yields a STRUCTURED async-iterable of
+// `{ type:"user", message:{ role, content }, parent_tool_use_id }` items
+// (via buildFramedReferenceMessages) instead of a flat text string. Extract
+// text from each yielded item's `message.content` — a string as-is, or an
+// array of blocks joined by the `.text` of its text blocks.
+function contentToText(content: any): string {
+  if (typeof content === "string") return content
+  if (Array.isArray(content)) {
+    return content
+      .filter((b) => b && b.type === "text" && typeof b.text === "string")
+      .map((b) => b.text)
+      .join("\n")
+  }
+  return ""
+}
+
+async function getPromptText(): Promise<string> {
   const p = capturedQueryParams?.prompt
   if (typeof p === "string") return p
-  // AsyncIterable case — just coerce; this test uses a text prompt
+  if (p && typeof p[Symbol.asyncIterator] === "function") {
+    const parts: string[] = []
+    for await (const item of p as AsyncIterable<any>) {
+      parts.push(contentToText(item?.message?.content))
+    }
+    return parts.join("\n")
+  }
+  if (p && typeof p[Symbol.iterator] === "function") {
+    const parts: string[] = []
+    for (const item of p as Iterable<any>) {
+      parts.push(contentToText(item?.message?.content))
+    }
+    return parts.join("\n")
+  }
   return String(p)
 }
 
@@ -102,7 +132,7 @@ describe("issue #368: <system-reminder> preservation by adapter", () => {
 
     await (await post(app, body)).json()
 
-    const prompt = getPromptText()
+    const prompt = await getPromptText()
     expect(prompt).toContain("bg_0aaa50b0")
     expect(prompt).toContain("bg_8ff9ed0f")
     expect(prompt).toContain("[ALL BACKGROUND TASKS COMPLETE]")
@@ -126,7 +156,7 @@ describe("issue #368: <system-reminder> preservation by adapter", () => {
 
     await (await post(app, body)).json()
 
-    const prompt = getPromptText()
+    const prompt = await getPromptText()
     expect(prompt).toContain("bg_0aaa50b0")
     expect(prompt).toContain("bg_8ff9ed0f")
   })
@@ -157,7 +187,7 @@ describe("issue #368: <system-reminder> preservation by adapter", () => {
 
     await (await post(app, body, { "User-Agent": DROID_UA })).json()
 
-    const prompt = getPromptText()
+    const prompt = await getPromptText()
     expect(prompt).not.toContain("% pwd")
     expect(prompt).not.toContain("/Users/dev/project")
     expect(prompt).toContain("what does this repo do?")

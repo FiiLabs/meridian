@@ -70,7 +70,7 @@ import { filterBetasForProfile, getBetaPolicyFromEnv } from "./betas"
 import { createFileChangeHook, extractFileChangesFromMessages, formatFileChangeSummary, type FileChange } from "./fileChanges"
 import { detectTokenAnomalies, formatAnomalyAlerts, type TokenSnapshot } from "./tokenHealth"
 import { computeCacheHitRate, formatUsageSummary } from "./tokenUsage"
-import { sanitizeTextContent } from "./sanitize"
+import { sanitizeTextContent, scrubResponseText, makeLeadingScrubber } from "./sanitize"
 import {
   computeLineageHash,
   hashMessage,
@@ -238,57 +238,101 @@ function flattenUserContent(
 
 
 /**
+ * Frame a fresh (non-resume) full history as an INERT reference block, not a
+ * continuable transcript.
+ *
+ * Upstream renders fresh-path assistant turns as `[Assistant: …]` (single string
+ * or discrete user messages). That still reads to the single-turn completion
+ * model as a transcript to CONTINUE: it fabricates the next turn, invents tool
+ * calls, or prepends harness scaffolding (`<system-reminder>`, role labels) into
+ * its reply (#496/#111/#386; reproduced on prod 2026-07-16). This collapses all
+ * prior turns into ONE framed "read-only record" user block — a numbered, inert
+ * `(N) user:/assistant:` digest that reads as notes that already happened — then
+ * emits the genuine latest user turn preserved. The last thing the model sees is
+ * the real request, not a dangling assistant turn to continue.
+ *
+ * Prior USER-turn image/document/file blocks are carried as attachments on the
+ * reference turn so multimodal is not lost. Resume/undo delta paths do NOT use
+ * this (they send the user-only delta; the SDK already holds prior turns).
+ */
+function buildFramedReferenceMessages(
+  messages: Array<{ role: string; content: any }>,
+  sanitizeOpts: import("./sanitize").SanitizeOptions = {},
+  toolIndex?: Map<string, import("./messages").ToolCallInfo>
+): Array<{ type: "user"; message: { role: string; content: any }; parent_tool_use_id: null }> {
+  const out: Array<{ type: "user"; message: { role: string; content: any }; parent_tool_use_id: null }> = []
+
+  // The live request is the last user turn; everything before it is history.
+  let liveIdx = -1
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role === "user") { liveIdx = i; break }
+  }
+  if (liveIdx < 0) liveIdx = messages.length // pathological — no user turn
+
+  // Collapse prior turns into a single framed reference block.
+  if (liveIdx > 0) {
+    const lines: string[] = []
+    const priorMedia: any[] = [] // real image/document/file blocks from prior user turns
+    for (let i = 0; i < liveIdx; i++) {
+      const m = messages[i]
+      if (!m) continue
+      if (m.role === "user" && hasMultimodalContent(m.content)) {
+        for (const b of normalizeStructuredUserContent(stripCacheControlDeep(m.content))) {
+          if (b && typeof b === "object" && MULTIMODAL_TYPES.has(b.type)) priorMedia.push(b)
+        }
+      }
+      const text = m.role === "user"
+        ? flattenUserContent(m.content, sanitizeOpts, toolIndex)
+        : flattenAssistantContent(m.content)
+      if (!text) continue // skips tool-use-only assistant turns / emptied user turns
+      // Neutral archival entries — a numbered, inert digest (proven-clean A/B
+      // "notes" shape) keeps who-said-what without inviting the model to write
+      // the next turn (NOT a line-leading User:/Assistant: live transcript).
+      lines.push(`(${lines.length + 1}) ${m.role === "user" ? "user" : "assistant"}: ${text}`)
+    }
+    if (lines.length || priorMedia.length) {
+      const framed =
+        "[Read-only record of earlier messages in this conversation, provided for " +
+        "context only. These turns are already complete — do NOT continue, repeat, " +
+        "or re-run them, and do NOT emit tool calls on their behalf. Read them for " +
+        "background, then handle the new message that follows on its own terms.]\n\n" +
+        lines.join("\n\n") +
+        "\n\n[End of record. The new message to handle follows below.]"
+      const content = priorMedia.length
+        ? [{ type: "text", text: framed }, ...priorMedia]
+        : framed
+      out.push({ type: "user" as const, message: { role: "user" as const, content }, parent_tool_use_id: null })
+    }
+  }
+
+  // Emit the live user turn, preserved (multimodal-safe).
+  const live = liveIdx >= 0 && liveIdx < messages.length ? messages[liveIdx] : undefined
+  if (live) {
+    const m = live
+    const content = hasMultimodalContent(m.content)
+      ? normalizeStructuredUserContent(stripCacheControlDeep(m.content))
+      : flattenUserContent(m.content, sanitizeOpts, toolIndex)
+    const nonEmpty = typeof content === "string" ? content.length > 0 : Array.isArray(content) ? content.length > 0 : content != null
+    if (nonEmpty) {
+      out.push({ type: "user" as const, message: { role: "user" as const, content }, parent_tool_use_id: null })
+    }
+  }
+
+  return out
+}
+
+/**
  * Build a prompt from all messages for a fresh (non-resume) session.
- * Used when retrying after a stale session UUID error.
+ * Used when retrying after a stale session UUID error. Frames history as an
+ * inert reference block — see buildFramedReferenceMessages.
  */
 function buildFreshPrompt(
   messages: Array<{ role: string; content: any }>,
   sanitizeOpts: import("./sanitize").SanitizeOptions = {}
 ): string | AsyncIterable<any> {
-  const hasMultimodal = messages.some((m) => hasMultimodalContent(m.content))
   const toolIndex = buildToolUseIndex(messages)
-
-  if (hasMultimodal) {
-    const structured: Array<{ type: "user"; message: { role: string; content: any }; parent_tool_use_id: null }> = []
-    for (const m of messages) {
-      if (m.role === "user") {
-        structured.push({
-          type: "user" as const,
-          message: { role: "user" as const, content: normalizeStructuredUserContent(stripCacheControlDeep(m.content)) },
-          parent_tool_use_id: null,
-        })
-      } else {
-        // Drops tool_use blocks and skips tool-use-only assistant messages
-        // (flattenAssistantContent returns "" for those).
-        const assistantText = flattenAssistantContent(m.content)
-        if (assistantText) {
-          structured.push({
-            type: "user" as const,
-            message: { role: "user" as const, content: `[Assistant: ${assistantText}]` },
-            parent_tool_use_id: null,
-          })
-        }
-      }
-    }
-    // See #553 — consolidate earlier-turn multimodal onto the final user turn.
-    const prompt = structured.length > 1 ? consolidateMultimodalOntoLastUser(structured) : structured
-    return (async function* () { for (const msg of prompt) yield msg })()
-  }
-
-  // Same anti-imitation convention as the structured branch above and the
-  // main prompt builder: user turns plain, assistant turns bracketed.
-  // 'Human:'/'Assistant:' transcript lines teach the model to complete the
-  // transcript itself (#496 self-talk).
-  return messages
-    .map((m) => {
-      if (m.role === "assistant") {
-        const assistantText = flattenAssistantContent(m.content)
-        return assistantText ? `[Assistant: ${assistantText}]` : ""
-      }
-      return flattenUserContent(m.content, sanitizeOpts, toolIndex)
-    })
-    .filter(Boolean)
-    .join("\n\n") || ""
+  const structured = buildFramedReferenceMessages(messages, sanitizeOpts, toolIndex)
+  return (async function* () { for (const msg of structured) yield msg })()
 }
 
 // Routine [PROXY] operational logging. Suppressed when config.silent is set so
@@ -879,14 +923,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       let structuredMessages: Array<{ type: "user"; message: { role: string; content: any }; parent_tool_use_id: null }> | undefined
       let textPrompt: string | undefined
 
-      if (hasMultimodal) {
-        // Structured messages preserve image/document/file blocks for Claude to see.
-        // On resume, only send user messages (SDK has assistant context already).
-        // On first request, include everything.
-        structuredMessages = []
+      // Tool-result attribution is indexed from the FULL history so ids resolve
+      // even when the originating call sits before a resume-delta boundary (#552).
+      const toolIndex = buildToolUseIndex(allMessages ?? messagesToConvert ?? [])
 
-        if (isResume) {
-          // Resume: only send user messages from the delta (SDK has the rest)
+      if (isResume) {
+        // --- RESUME DELTA (upstream behavior) ---
+        // The SDK already holds prior turns; send only the user-side delta.
+        if (hasMultimodal) {
+          structuredMessages = []
           for (const m of messagesToConvert) {
             if (m.role === "user") {
               structuredMessages.push({
@@ -895,67 +940,31 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 parent_tool_use_id: null,
               })
             }
+          }
+          // The SDK only surfaces multimodal blocks from the LAST user turn of a
+          // streamed prompt; earlier-turn images are otherwise dropped (#553).
+          if (structuredMessages.length > 1) {
+            structuredMessages = consolidateMultimodalOntoLastUser(structuredMessages)
           }
         } else {
-          // First request: all messages (system context now passed via appendSystemPrompt)
-          for (const m of messagesToConvert) {
-            if (m.role === "user") {
-              structuredMessages.push({
-                type: "user" as const,
-                message: { role: "user" as const, content: normalizeStructuredUserContent(stripCacheControlDeep(m.content)) },
-                parent_tool_use_id: null,
-              })
-            } else {
-              // Drops tool_use blocks and skips tool-use-only assistant messages
-              // (flattenAssistantContent returns "" for those).
-              const assistantText = flattenAssistantContent(m.content)
-              if (assistantText) {
-                structuredMessages.push({
-                  type: "user" as const,
-                  message: { role: "user" as const, content: `[Assistant: ${assistantText}]` },
-                  parent_tool_use_id: null,
-                })
-              }
-            }
-          }
-        }
-
-        // The SDK only surfaces multimodal blocks from the LAST user turn of a
-        // streamed prompt; images sitting in earlier turns (e.g. a read-tool
-        // result mid-conversation) are otherwise dropped and the model replies
-        // "I cannot see the image" (#553). Move them onto the final user turn.
-        if (structuredMessages.length > 1) {
-          structuredMessages = consolidateMultimodalOntoLastUser(structuredMessages)
+          // Text resume: user turns plain, assistant messages dropped entirely
+          // (replaying them as user text is the transcript-imitation seed, #496).
+          textPrompt = messagesToConvert
+            ?.map((m: { role: string; content: any }) => {
+              if (m.role === "assistant") return ""
+              return flattenUserContent(m.content, sanitizeOpts, toolIndex)
+            })
+            .filter(Boolean)
+            .join("\n\n") || ""
         }
       } else {
-        // Text prompt — convert messages to string.
-        // Sanitize each text block before flattening to strip orchestration
-        // wrappers (<env>, <task_metadata>, etc.) that harnesses inject.
-        // `<system-reminder>` is only stripped for adapters that leak CWD
-        // through it (Droid) — preserved otherwise so that harness state
-        // like oh-my-opencode's background-task IDs reaches the model.
-        // Tool-result attribution is indexed from the FULL history so ids
-        // resolve even when the originating call sits before a resume-delta
-        // boundary (#552).
-        const toolIndex = buildToolUseIndex(allMessages ?? messagesToConvert ?? [])
-        // NEVER render 'Human:'/'Assistant:' transcript lines — the model
-        // imitates that format, emitting 'Human: ...' turns itself and
-        // self-approving actions (#496 self-talk). Match the structured
-        // path's proven convention instead: user turns plain, assistant
-        // turns bracketed as '[Assistant: ...]'. On resume, drop assistant
-        // messages entirely — the resumed SDK session already contains
-        // those turns; replaying them as user text is the imitation seed.
-        textPrompt = messagesToConvert
-          ?.map((m: { role: string; content: any }) => {
-            if (m.role === "assistant") {
-              if (isResume) return ""
-              const assistantText = flattenAssistantContent(m.content)
-              return assistantText ? `[Assistant: ${assistantText}]` : ""
-            }
-            return flattenUserContent(m.content, sanitizeOpts, toolIndex)
-          })
-          .filter(Boolean)
-          .join("\n\n") || ""
+        // --- FRESH FULL REPLAY (our fix) ---
+        // Frame prior history as an INERT reference block instead of an
+        // `[Assistant: …]` transcript the model would continue (#496/#111/#386;
+        // prod leak 2026-07-16). Always structured — buildFramedReferenceMessages
+        // carries prior-turn media onto the reference turn and preserves the live
+        // user turn, so both text-only and multimodal fresh requests go through it.
+        structuredMessages = buildFramedReferenceMessages(messagesToConvert, sanitizeOpts, toolIndex)
       }
 
       // Create a fresh prompt value — can be called multiple times for retry
@@ -1751,6 +1760,21 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             claudeLog("response.fallback_used", { mode: "non_stream", reason: "no_content_blocks" })
           }
 
+          // Scrub leaked harness scaffolding the model may have prepended to its
+          // reply on the fresh path (issues #111/#386/#496; reproduced 2026-07-16
+          // as a prepended <system-reminder> block). Only the FIRST text block's
+          // leading edge is touched. See scrubResponseText.
+          {
+            const firstText = contentBlocks.find((b) => b.type === "text") as { type: "text"; text: string } | undefined
+            if (firstText && typeof firstText.text === "string") {
+              const cleaned = scrubResponseText(firstText.text)
+              if (cleaned !== firstText.text) {
+                claudeLog("response.scaffold_scrubbed", { mode: "non_stream", removedChars: firstText.text.length - cleaned.length })
+                firstText.text = cleaned
+              }
+            }
+          }
+
           const totalDurationMs = Date.now() - requestStartAt
 
           claudeLog("response.completed", {
@@ -2126,6 +2150,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
               let nextClientBlockIndex = 0
               const sdkToClientIndex = new Map<number, number>()
 
+              // Leaked-scaffolding scrub for the FIRST text block of the reply.
+              // Buffers only while the head could be leaked scaffolding (a
+              // prepended <system-reminder> / [Assistant:] / role label — the
+              // fresh-path continuation leak). Normal replies stream through with
+              // no buffering. Matched on the SDK-side block index (stable across
+              // this block's start/delta/stop). See makeLeadingScrubber.
+              let headTextSdkIndex: number | undefined
+              const headScrubber = makeLeadingScrubber()
+
               const guardedResponse = guardUpstreamIdle(response, UPSTREAM_IDLE_MS, (sinceLastMs) =>
                 claudeLog("upstream.stalled", {
                   mode: "stream",
@@ -2320,6 +2353,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                       if (eventIndex !== undefined) {
                         sdkToClientIndex.set(eventIndex, nextClientBlockIndex++)
                       }
+                      // Mark the FIRST text block as the head to scrub for leaked
+                      // scaffolding (only its leading edge is buffered/cleaned).
+                      if (headTextSdkIndex === undefined && block?.type === "text" && eventIndex !== undefined) {
+                        headTextSdkIndex = eventIndex
+                      }
                     }
 
                     // Skip deltas and stops for MCP tool blocks
@@ -2330,6 +2368,30 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     // Remap block index to monotonic client index
                     if (eventIndex !== undefined && sdkToClientIndex.has(eventIndex)) {
                       (event as any).index = sdkToClientIndex.get(eventIndex)
+                    }
+
+                    // Leaked-scaffolding scrub on the head text block's stream:
+                    // buffer/clean its leading edge, pass the rest through verbatim.
+                    if (eventIndex !== undefined && eventIndex === headTextSdkIndex) {
+                      if (eventType === "content_block_delta" && (event as any).delta?.type === "text_delta") {
+                        const emit = headScrubber.feed(String((event as any).delta.text ?? ""))
+                        if (emit === null || emit === "") continue // withhold or nothing to send
+                        ;(event as any).delta.text = emit
+                        // fall through to forward the cleaned delta
+                      } else if (eventType === "content_block_stop") {
+                        const tail = headScrubber.flush()
+                        if (tail) {
+                          const clientIdx = sdkToClientIndex.get(eventIndex) ?? eventIndex
+                          safeEnqueue(encoder.encode(
+                            `event: content_block_delta\ndata: ${JSON.stringify({
+                              type: "content_block_delta",
+                              index: clientIdx,
+                              delta: { type: "text_delta", text: tail },
+                            })}\n\n`
+                          ), "head_scrub_flush")
+                        }
+                        // fall through to forward the content_block_stop
+                      }
                     }
 
                     // Skip intermediate message_delta with stop_reason: tool_use
