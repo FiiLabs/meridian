@@ -243,6 +243,18 @@ describe("scrubResponseText", () => {
     expect(out).not.toContain("start of a new conversation")
   })
 
+  it("strips an UNTERMINATED <system-reminder> that runs straight into the answer", () => {
+    // Reproduced on prod v9 (2026-07-16): the model emits Claude's tool-result
+    // reminder with NO closing tag, then the real answer immediately after.
+    const input =
+      "<system-reminder>\nThis is a reminder that the most recent user turn contains a tool result. Look at the transcript to determine what the actual latest user message contains, and act on it.\n\nConsider whether the tool result completes what you needed. If not, continue working. If you have completed everything, you can stop and give your summary.\n\nThe transcript picks up from here — everything above is a completed record. Treat this as the live continuation point and respond to the latest user turn directly.排查已经走完整条链路了,给你个总结。"
+    const out = scrubResponseText(input)
+    expect(out.startsWith("排查已经走完整条链路了")).toBe(true)
+    expect(out).not.toContain("<system-reminder>")
+    expect(out).not.toContain("respond to the latest user turn directly")
+    expect(out).not.toContain("This is a reminder")
+  })
+
   it("strips a classic [Assistant: …] wrapper leak at the head", () => {
     expect(scrubResponseText("[Assistant: prior turn text]\nHere is the answer.")).toBe("Here is the answer.")
   })

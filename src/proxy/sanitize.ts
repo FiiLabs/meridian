@@ -136,6 +136,12 @@ export function sanitizeTextContent(text: string, opts: SanitizeOptions = {}): s
 const LEADING_SCAFFOLD_PATTERNS: RegExp[] = [
   // Fabricated harness context blocks (paired tags) at the head.
   /^<system-reminder\b[^>]*>[\s\S]*?<\/system-reminder>/i,
+  // UNTERMINATED <system-reminder>: the model reproduces Claude's injected
+  // reminder but omits the closing tag and runs straight into its answer (no
+  // delimiter). Anchor the end greedily on Claude's known reminder-closing
+  // sentences — these only occur in that harness text, and this fires only when
+  // the reply STARTS with <system-reminder>, so it never touches real content.
+  /^<system-reminder\b[^>]*>[\s\S]*(?:respond to the latest user turn directly\.|Keep going until the task is fully handled\.|you can stop and give your summary\.|without additional tool calls\.)/i,
   /^<(env|task_metadata|thinking|tool_output|tool_exec|skill_content)\b[^>]*>[\s\S]*?<\/\1>/i,
   // Classic `[Assistant: …]` / `[Human: …]` wrapper leak (single line).
   /^\[(assistant|human)\b[^\]\n]*\]?/i,
