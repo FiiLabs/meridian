@@ -60,7 +60,7 @@ interface OAuthCredentials {
   rateLimitTier?: string
 }
 
-interface CredentialsFile {
+export interface CredentialsFile {
   claudeAiOauth: OAuthCredentials
   [key: string]: unknown
 }

@@ -68,3 +68,31 @@ export async function requireAuth(c: Context, next: Next) {
 
   return next()
 }
+
+/** Whether the privileged /admin surface is enabled (MERIDIAN_ADMIN_TOKEN set). */
+export function adminAuthEnabled(): boolean {
+  return Boolean(process.env.MERIDIAN_ADMIN_TOKEN)
+}
+
+/**
+ * Middleware for the privileged /admin/* surface (credential + egress-proxy
+ * hot-swap). Unlike requireAuth this FAILS CLOSED: when MERIDIAN_ADMIN_TOKEN is
+ * unset the whole admin surface is disabled and every request gets 401. The
+ * token is kept SEPARATE from the seat's MERIDIAN_API_KEY so the high-privilege
+ * ops (swapping which Anthropic account a seat bills, changing egress) don't
+ * ride on the same secret used for ordinary request forwarding.
+ */
+export async function requireAdminAuth(c: Context, next: Next) {
+  const token = process.env.MERIDIAN_ADMIN_TOKEN || ""
+  const provided = extractKey(c)
+  if (!token || !provided || !safeCompare(provided, token)) {
+    return c.json({
+      type: "error",
+      error: {
+        type: "authentication_error",
+        message: "Admin authentication required",
+      },
+    }, 401)
+  }
+  return next()
+}

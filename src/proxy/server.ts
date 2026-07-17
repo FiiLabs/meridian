@@ -4,6 +4,7 @@ import { serve } from "@hono/node-server"
 import type { Server } from "node:http"
 import { homedir } from "node:os"
 import { join } from "node:path"
+import { writeFileSync } from "node:fs"
 import { query } from "@anthropic-ai/claude-agent-sdk"
 import { rateLimitStore } from "./rateLimitStore"
 import { guardUpstreamIdle, UpstreamIdleError } from "./streamIdleGuard"
@@ -48,13 +49,14 @@ import { LRUMap } from "../utils/lruMap"
 import { telemetryStore, diagnosticLog, createTelemetryRoutes, landingHtml, renderPrometheusMetrics } from "../telemetry"
 import type { RequestMetric } from "../telemetry"
 import { classifyError, extractSdkTermination, formatSdkTermination, isStaleSessionError, isRateLimitError, isExtraUsageRequiredError, isExpiredTokenError } from "./errors"
-import { refreshOAuthToken, ensureFreshToken, startBackgroundRefresh, stopBackgroundRefresh, createPlatformCredentialStore, type CredentialStore } from "./tokenRefresh"
+import { refreshOAuthToken, ensureFreshToken, startBackgroundRefresh, stopBackgroundRefresh, createPlatformCredentialStore, type CredentialStore, type CredentialsFile } from "./tokenRefresh"
 import { checkPluginConfigured } from "./setup"
 import { mapModelToClaudeModel, resolveClaudeExecutableAsync, resolveSdkModelDefaults, isClosedControllerError, getClaudeAuthStatusAsync, getAuthCacheInfo, getResolvedClaudeExecutableInfo, hasExtendedContext, stripExtendedContext, recordExtendedContextUnavailable } from "./models"
 import type { AnthropicSseEvent } from "./openai"
 import { translateOpenAiToAnthropic, translateAnthropicToOpenAi, buildModelList, createSseTranslator } from "./openai"
 import { extractAdvisorModel, getLastUserMessage, stripAdvisorTools, stripNonStandardStreamFields, consolidateMultimodalOntoLastUser, MULTIMODAL_TYPES, buildToolUseIndex, describeToolCall } from "./messages"
-import { requireAuth, authEnabled } from "./auth"
+import { requireAuth, authEnabled, requireAdminAuth } from "./auth"
+import { initEgressProxy, setEgressProxy, getEgressState } from "./egressProxy"
 import { detectAdapter } from "./adapters/detect"
 import { buildQueryOptions, type QueryContext } from "./query"
 import { normalizeEffort } from "./effort"
@@ -453,6 +455,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   app.use("/settings/*", requireAuth)
   app.use("/settings", requireAuth)
   app.use("/auth/*", requireAuth)
+  // Privileged hot-swap surface (credentials + egress proxy). Gated by its OWN
+  // token (MERIDIAN_ADMIN_TOKEN) and FAILS CLOSED — disabled/401 when unset.
+  app.use("/admin/*", requireAdminAuth)
 
   app.get("/", (c) => {
     // API clients get JSON, browsers get the landing page
@@ -3315,6 +3320,76 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     )
   })
 
+  // --- Admin: hot-swap OAuth credentials (no restart) ---
+  // Replace a seat's Claude subscription account live. The next SDK session
+  // reads the new ~/.claude/.credentials.json; in-flight sessions finish on the
+  // old account. Replaces refresh-seat.sh's "update sealed env + restart CVM".
+  // Body: { credentials: <.credentials.json content, object or string>,
+  //         claudeJson?: <.claude.json content>, profile?: id }
+  app.post("/admin/credentials", async (c) => {
+    let body: any
+    try { body = await c.req.json() } catch { return c.json({ success: false, message: "invalid json body" }, 400) }
+    const raw = body?.credentials
+    if (raw == null) return c.json({ success: false, message: "credentials required" }, 400)
+    let creds: any
+    try { creds = typeof raw === "string" ? JSON.parse(raw) : raw } catch { return c.json({ success: false, message: "credentials is not valid JSON" }, 400) }
+    const oauth = creds?.claudeAiOauth
+    if (!oauth || typeof oauth.accessToken !== "string" || typeof oauth.refreshToken !== "string") {
+      // Reject malformed creds up front so we never brick the seat's login.
+      return c.json({ success: false, message: "credentials must contain claudeAiOauth.accessToken and refreshToken" }, 400)
+    }
+    const profile = resolveProfile(
+      finalConfig.profiles,
+      finalConfig.defaultProfile,
+      body?.profile || c.req.header("x-meridian-profile") || undefined
+    )
+    const store = credentialStoreForProfile(profile)
+    if (!store) return c.json({ success: false, message: "no credential store for profile" }, 500)
+    const ok = await store.write(creds as CredentialsFile)
+    if (!ok) return c.json({ success: false, message: "failed to write credentials" }, 500)
+    if (body?.claudeJson != null) {
+      try {
+        const cj = typeof body.claudeJson === "string" ? body.claudeJson : JSON.stringify(body.claudeJson)
+        writeFileSync(join(homedir(), ".claude.json"), cj, { mode: 0o600 })
+      } catch (e) {
+        plog(`[admin] warning: failed to write .claude.json: ${(e as Error).message}`)
+      }
+    }
+    // The previous account's quota snapshot no longer applies.
+    rateLimitStore.clear()
+    plog(`[admin] credentials hot-swapped for profile=${profile.id} (expiresAt=${oauth.expiresAt ?? "?"})`)
+    return c.json({ success: true, profile: profile.id, expiresAt: oauth.expiresAt ?? null })
+  })
+
+  // --- Admin: hot-swap / remove the egress (ProxyLite) proxy (no restart) ---
+  // Body: { socks5: "socks5://user:pass@host:port" }  → route egress through it
+  //       { socks5: null } | { disable: true }        → direct egress (no proxy)
+  // Persisted to the seat volume so the choice survives a restart. The secret
+  // URL is never echoed back.
+  app.post("/admin/proxy", async (c) => {
+    let body: any
+    try { body = await c.req.json() } catch { return c.json({ success: false, message: "invalid json body" }, 400) }
+    let socks5: string | null
+    if (body?.disable === true || body?.socks5 === null || body?.socks5 === "") {
+      socks5 = null
+    } else if (typeof body?.socks5 === "string") {
+      socks5 = body.socks5.trim()
+    } else {
+      return c.json({ success: false, message: "provide socks5:\"socks5://…\" or socks5:null / disable:true" }, 400)
+    }
+    if (socks5 && !/^socks5h?:\/\//i.test(socks5)) {
+      return c.json({ success: false, message: "socks5 must start with socks5:// or socks5h://" }, 400)
+    }
+    const state = await setEgressProxy(socks5)
+    plog(`[admin] egress proxy ${state.socks5 ? "set (via ProxyLite)" : "DISABLED (direct)"} running=${state.running}`)
+    return c.json({ success: true, proxy: { enabled: state.socks5 !== null, endpoint: state.endpoint, running: state.running, source: state.source } })
+  })
+
+  app.get("/admin/proxy", (c) => {
+    const state = getEgressState()
+    return c.json({ enabled: state.socks5 !== null, endpoint: state.endpoint, running: state.running, source: state.source })
+  })
+
   // --- OpenAI Chat Completions Compatibility ---
   // Translates OpenAI /v1/chat/completions requests to Anthropic format and
   // routes them through the internal /v1/messages handler via app.fetch().
@@ -3745,6 +3820,19 @@ export function installProxyProcessErrorHandlers(): void {
 
 export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promise<ProxyInstance> {
   claudeExecutable = await resolveClaudeExecutableAsync()
+
+  // Egress proxy (ProxyLite) management. Meridian now owns the local gost shim
+  // (moved out of entrypoint.sh) so the proxy can be hot-swapped / removed via
+  // POST /admin/proxy WITHOUT a restart. Run FIRST so HTTP(S)_PROXY is exported
+  // before any outbound (token refresh) or SDK subprocess spawn. No-op (direct
+  // egress) unless a proxy is configured or the admin surface is enabled.
+  try {
+    const egress = initEgressProxy()
+    if (egress.running) plog(`[egress] managed — endpoint=${egress.endpoint} proxy=${egress.socks5 ? "on" : "direct"} source=${egress.source}`)
+  } catch (e) {
+    plog(`[egress] init failed: ${(e as Error).message}`)
+  }
+
   const { app, config: finalConfig, initPlugins } = createProxyServer(config)
   if (initPlugins) await initPlugins()
 
