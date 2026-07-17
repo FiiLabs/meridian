@@ -504,9 +504,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
 
     return withClaudeLogContext({ requestId: requestMeta.requestId, endpoint: requestMeta.endpoint }, async () => {
       // Hoist adapter detection before try so it's available in the catch block for telemetry
-      const adapter = detectAdapter(c)
+      let adapter = detectAdapter(c)
       try {
         const body = await c.req.json()
+        // Refine detection now that the body is available: a privacy proxy can
+        // strip Claude Code's `claude-cli/` User-Agent while forwarding the body
+        // intact, so header-only detection above misclassifies it as the
+        // default (OpenCode). Re-run with the body so metadata.user_id recovers
+        // the Claude Code adapter and its stable session id is used for resume.
+        adapter = detectAdapter(c, body)
 
         // Validate required fields
         if (!Array.isArray(body.messages)) {

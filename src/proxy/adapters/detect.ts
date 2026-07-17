@@ -13,7 +13,7 @@ import { crushAdapter } from "./crush"
 import { passthroughAdapter } from "./passthrough"
 import { piAdapter } from "./pi"
 import { forgeCodeAdapter } from "./forgecode"
-import { claudeCodeAdapter } from "./claudecode"
+import { claudeCodeAdapter, extractClaudeCodeSessionId } from "./claudecode"
 import { openAiAdapter } from "./openai"
 import { cherryAdapter } from "./cherry"
 import { loadAdapterInstances, matchesInstance, type AdapterInstanceDef } from "../adapterInstances"
@@ -68,7 +68,16 @@ function isLiteLLMRequest(c: Context): boolean {
  * 5. User-Agent starts with "Charm-Crush/"  → Crush adapter
  * 6. User-Agent starts with "claude-cli/"  → Claude Code adapter
  * 7. litellm/* UA or x-litellm-* headers   → LiteLLM passthrough adapter
- * 8. Default                                → MERIDIAN_DEFAULT_AGENT env var, or OpenCode
+ * 8. body metadata.user_id carries a Claude Code session_id → Claude Code adapter
+ * 9. Default                                → MERIDIAN_DEFAULT_AGENT env var, or OpenCode
+ *
+ * Rule 8 is body-based: a privacy proxy in front of meridian can strip the
+ * `claude-cli/` User-Agent (rule 6) while still forwarding the request body
+ * verbatim. Claude Code embeds its stable conversation id in
+ * `metadata.user_id` (JSON `{session_id}`) — a signal no other client sends —
+ * so we recover the correct adapter from the body when the UA is gone.
+ * Without it, such traffic falls to the OpenCode default, its stable session
+ * id is ignored, and session resume degrades to fragile fingerprinting.
  */
 /**
  * Materialize an adapter INSTANCE (#476): the base adapter's behavior under
@@ -92,7 +101,7 @@ function makeInstanceAdapter(name: string, def: AdapterInstanceDef): AgentAdapte
   }
 }
 
-export function detectAdapter(c: Context): AgentAdapter {
+export function detectAdapter(c: Context, body?: unknown): AgentAdapter {
   const agentOverride = c.req.header("x-meridian-agent")?.toLowerCase()
   if (agentOverride && ADAPTER_MAP[agentOverride]) {
     return ADAPTER_MAP[agentOverride]!
@@ -159,6 +168,14 @@ export function detectAdapter(c: Context): AgentAdapter {
 
   if (isLiteLLMRequest(c)) {
     return passthroughAdapter
+  }
+
+  // Body-based Claude Code recovery (rule 8): the UA was stripped upstream but
+  // the body still carries Claude Code's metadata.user_id session_id. Placed
+  // last so every explicit header/UA signal keeps priority — this only
+  // reclassifies traffic that would otherwise fall to the default adapter.
+  if (body !== undefined && extractClaudeCodeSessionId(body)) {
+    return claudeCodeAdapter
   }
 
   return defaultAdapter

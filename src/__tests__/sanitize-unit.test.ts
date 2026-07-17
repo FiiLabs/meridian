@@ -273,9 +273,38 @@ describe("scrubResponseText", () => {
     expect(scrubResponseText(input)).toBe("the answer")
   })
 
+  it("strips an UNTERMINATED reminder with a NOVEL closing (new-conversation variant)", () => {
+    // v10 anchored only on a few tool-result phrasings; this new-conversation
+    // reminder leaked unterminated and slipped through. Change B adds the anchor.
+    const input =
+      "<system-reminder>\nThis is the start of a new conversation. Any previous conversation was ended. The user isn't available right now, so you should NOT ask questions.这是本轮真实回答:先确认隧道状态。"
+    const out = scrubResponseText(input)
+    expect(out.startsWith("这是本轮真实回答")).toBe(true)
+    expect(out).not.toContain("<system-reminder>")
+    expect(out).not.toContain("start of a new conversation")
+  })
+
+  it("strips an UNTERMINATED reminder ending with a gentle-reminder tail", () => {
+    const input =
+      "<system-reminder>\nThe task tools haven't been used recently.\nThis is just a gentle reminder - ignore if not applicable.\n答案:已经修好了。"
+    const out = scrubResponseText(input)
+    expect(out.startsWith("答案:已经修好了。")).toBe(true)
+    expect(out).not.toContain("gentle reminder")
+  })
+
+  it("strips a leaked <available_skills> block at the head (new tag opener)", () => {
+    const input = "<available_skills>\n- deep-research\n- dataviz\n</available_skills>\nHere is the answer."
+    expect(scrubResponseText(input)).toBe("Here is the answer.")
+  })
+
   it("leaves a normal reply untouched", () => {
     const normal = "当然可以,我帮你排查一下 proxylite 隧道。首先确认机器还活着。"
     expect(scrubResponseText(normal)).toBe(normal)
+  })
+
+  it("does NOT strip a gentle-reminder phrase that appears in normal prose (not at head, no tag)", () => {
+    const input = "顺便说一句:this is just a gentle reminder to commit your work before deploying."
+    expect(scrubResponseText(input)).toBe(input)
   })
 
   it("does NOT strip a mid-body mention of <system-reminder>", () => {

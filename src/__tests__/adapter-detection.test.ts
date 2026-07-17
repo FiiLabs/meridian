@@ -283,6 +283,57 @@ describe("detectAdapter — OpenCode detection", () => {
   })
 })
 
+describe("detectAdapter — body-based Claude Code recovery (UA stripped upstream)", () => {
+  // A privacy proxy can strip Claude Code's `claude-cli/` User-Agent while
+  // forwarding the body intact. Claude Code embeds its stable conversation id
+  // in metadata.user_id (JSON {session_id}); detection recovers the adapter
+  // from the body so session resume keeps working. See detect.ts rule 8.
+  const ccBody = (sessionId: string = "cc-conv-1") => ({
+    model: "claude-opus-4-8",
+    messages: [{ role: "user", content: "hi" }],
+    metadata: { user_id: JSON.stringify({ session_id: sessionId, account_uuid: "acc" }) },
+  })
+
+  it("recovers claudeCodeAdapter from metadata.user_id when the UA is absent", () => {
+    // No claude-cli UA, no x-opencode-session — would otherwise fall to opencode.
+    expect(detectAdapter(makeContext(""), ccBody()).name).toBe("claude-code")
+  })
+
+  it("is a no-op without a body (header-only call unchanged → opencode default)", () => {
+    expect(detectAdapter(makeContext("")).name).toBe("opencode")
+  })
+
+  it("does NOT fire when metadata.user_id has no session_id", () => {
+    const body = { messages: [{ role: "user", content: "hi" }], metadata: { user_id: JSON.stringify({ account_uuid: "acc" }) } }
+    expect(detectAdapter(makeContext(""), body).name).toBe("opencode")
+  })
+
+  it("does NOT fire for a body without metadata", () => {
+    expect(detectAdapter(makeContext(""), { messages: [{ role: "user", content: "hi" }] }).name).toBe("opencode")
+  })
+
+  it("does NOT throw / stays opencode for a non-JSON metadata.user_id", () => {
+    const body = { messages: [{ role: "user", content: "hi" }], metadata: { user_id: "not-json-plain-string" } }
+    expect(detectAdapter(makeContext(""), body).name).toBe("opencode")
+  })
+
+  it("explicit x-opencode-session still wins over the body signal", () => {
+    expect(detectAdapter(makeContext("", { "x-opencode-session": "s1" }), ccBody()).name).toBe("opencode")
+  })
+
+  it("explicit x-meridian-agent still wins over the body signal", () => {
+    expect(detectAdapter(makeContext("", { "x-meridian-agent": "pi" }), ccBody()).name).toBe("pi")
+  })
+
+  it("an unambiguous opencode/ UA still wins over the body signal", () => {
+    expect(detectAdapter(makeContext("opencode/1.0"), ccBody()).name).toBe("opencode")
+  })
+
+  it("a claude-cli/ UA already routes to claude-code (body agrees, no change)", () => {
+    expect(detectAdapter(makeContext("claude-cli/2.0.0"), ccBody()).name).toBe("claude-code")
+  })
+})
+
 describe("detectAdapter — adapter contracts", () => {
   it("detected droid adapter can extract CWD from Droid-format body", () => {
     const adapter = detectAdapter(makeContext("factory-cli/0.89.0"))

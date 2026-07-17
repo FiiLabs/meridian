@@ -138,11 +138,39 @@ const LEADING_SCAFFOLD_PATTERNS: RegExp[] = [
   /^<system-reminder\b[^>]*>[\s\S]*?<\/system-reminder>/i,
   // UNTERMINATED <system-reminder>: the model reproduces Claude's injected
   // reminder but omits the closing tag and runs straight into its answer (no
-  // delimiter). Anchor the end greedily on Claude's known reminder-closing
-  // sentences — these only occur in that harness text, and this fires only when
-  // the reply STARTS with <system-reminder>, so it never touches real content.
-  /^<system-reminder\b[^>]*>[\s\S]*(?:respond to the latest user turn directly\.|Keep going until the task is fully handled\.|you can stop and give your summary\.|without additional tool calls\.)/i,
-  /^<(env|task_metadata|thinking|tool_output|tool_exec|skill_content)\b[^>]*>[\s\S]*?<\/\1>/i,
+  // delimiter). Anchor the end greedily on Claude's known reminder hallmark
+  // sentences — these strings only occur in that harness text, and the whole
+  // pattern requires the reply to START with <system-reminder>, so it never
+  // touches real content. Fully-general blank-line bounding is deliberately
+  // avoided: Claude reminders are multi-paragraph (they contain their own blank
+  // lines), so a "strip to first \n\n" would leave the reminder's tail behind.
+  // Enrich this list as new reminder phrasings are observed leaking.
+  new RegExp(
+    "^<system-reminder\\b[^>]*>[\\s\\S]*(?:" +
+    [
+      // continuation / new-conversation reminders (#496, reproduced 2026-07-16)
+      "respond to the latest user turn directly\\.",
+      "This is the start of a new conversation\\.",
+      "Any previous conversation was ended\\.",
+      "so you should NOT ask questions\\.?",
+      "The transcript picks up from here",
+      "everything above is a completed record",
+      "Treat this as the live continuation point",
+      // tool-result / keep-going reminders (v9 residual)
+      "Keep going until the task is fully handled\\.",
+      "you can stop and give your summary\\.",
+      "without additional tool calls\\.",
+      "contains a tool result\\.",
+      "Look at the transcript to determine what the actual latest user message",
+      // generic ephemeral-reminder tails
+      "This is just a gentle reminder[^\\n]*",
+      "unless the user explicitly asks you to\\.",
+      "unless it is highly relevant to your task\\.",
+    ].join("|") +
+    ")",
+    "i",
+  ),
+  /^<(env|task_metadata|thinking|tool_output|tool_exec|skill_content|skill_files|directories|available_skills|system_information|current_working_directory|background_output)\b[^>]*>[\s\S]*?<\/\1>/i,
   // Classic `[Assistant: …]` / `[Human: …]` wrapper leak (single line).
   /^\[(assistant|human)\b[^\]\n]*\]?/i,
   // Bare role label at the very start of the reply.
@@ -202,6 +230,14 @@ export function couldBeScaffoldPrefix(head: string): boolean {
   if (s === "") return true // only whitespace so far — undecided
   if (/^\(\s*\d/.test(s)) return true // "(3" → possible numbered marker
   if (/^\(\s*$/.test(s)) return true // just "(" — could become "(3)"
+  // A trailing CLOSING-tag fragment ("</system-", "</env") means a scaffold
+  // block's closing tag is still streaming in. Without this, an unterminated-
+  // reminder pattern can strip up to a known sentence and prematurely resolve,
+  // leaving the "</system-reminder>" tail behind (it isn't an opener, so the
+  // check below would report clean). Keep buffering until the tag completes so
+  // the paired-tag pattern can remove the whole block. Only fires for "</xxx"
+  // fragments — an opening "<div>" (with '>') and normal prose are unaffected.
+  if (/^<\/[a-z][a-z0-9_-]*$/i.test(s)) return true
   return SCAFFOLD_OPENERS.some((o) => o.startsWith(s) || s.startsWith(o))
 }
 
